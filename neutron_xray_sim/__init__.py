@@ -78,12 +78,19 @@ from .artifacts import (
 from .reconstructor import (
     reconstruct,
     reconstruct_pair,
+    AVAILABLE_ALGORITHMS,
+)
+
+from .io import (
+    SimCache,
+    tag_to_slug,
 )
 
 from .histogram import (
     HistogramResult,
     GMMFitResult,
     ArtifactSignatures,
+    ClusterQualityMetrics,
     compute_bimodal_histogram,
     compute_ground_truth_histogram,
     fit_gmm,
@@ -91,9 +98,13 @@ from .histogram import (
     segment_by_gmm,
     segment_by_polygon,
     detect_artifact_signatures,
+    evaluate_histogram_quality,
+    compare_algorithms,
     plot_bimodal_histogram,
     plot_ground_truth_comparison,
     plot_comparison_grid,
+    plot_cross_algorithm_grid,
+    make_cross_algorithm_sinos,
 )
 
 from .simulation import (
@@ -121,14 +132,19 @@ __all__ = [
     "ArtifactConfig", "inject_sinogram_artifacts",
     "inject_volume_artifacts", "PRESET_CONFIGS",
     # Reconstruction
-    "reconstruct", "reconstruct_pair",
+    "reconstruct", "reconstruct_pair", "AVAILABLE_ALGORITHMS",
+    # IO / cache
+    "SimCache", "tag_to_slug",
     # Histogram
-    "HistogramResult", "GMMFitResult", "ArtifactSignatures",
+    "HistogramResult", "GMMFitResult", "ArtifactSignatures", "ClusterQualityMetrics",
     "compute_bimodal_histogram", "compute_ground_truth_histogram",
     "fit_gmm", "auto_fit_gmm",
     "segment_by_gmm", "segment_by_polygon",
     "detect_artifact_signatures",
+    "evaluate_histogram_quality", "compare_algorithms",
     "plot_bimodal_histogram", "plot_ground_truth_comparison", "plot_comparison_grid",
+    "plot_cross_algorithm_grid", "make_cross_algorithm_sinos",
     # Simulation
     "SimulationResult", "DualModalitySimulation", "run_artifact_survey",
+    "ClusterQualityMetrics",
 ]

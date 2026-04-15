@@ -341,8 +341,8 @@ def make_sinogram_pair(
     """
     angles = np.linspace(0.0, angle_range_deg, n_angles, endpoint=False)
 
-    print(f"[projector] Projecting {n_angles} angles "
-          f"({'ASTRA GPU' if (use_astra and ASTRA_OK) else 'NumPy CPU'}) …")
+    _backend = "ASTRA GPU" if (use_astra and ASTRA_OK) else "NumPy CPU"
+    print(f"[projector] Projecting {n_angles} angles ({_backend}) …")
 
     print("  → X-ray (polychromatic) …")
     xray = project_xray(

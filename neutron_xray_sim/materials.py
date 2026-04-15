@@ -69,6 +69,11 @@ class Material:
         """Total neutron scatter coefficient  [cm⁻¹]."""
         return self.mu_n_coh + self.mu_n_inc
 
+    @property
+    def rho(self) -> float:
+        """Mass density  [g / cm³]. Alias for ``density_gcc``."""
+        return self.density_gcc
+
     # ── X-ray properties ──────────────────────────────────────────────────────
 
     def mu_x_at(self, energy_keV: float) -> float:

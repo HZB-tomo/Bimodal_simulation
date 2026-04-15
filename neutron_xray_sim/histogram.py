@@ -40,10 +40,16 @@ __all__ = [
     "segment_by_gmm",
     "segment_by_polygon",
     "detect_artifact_signatures",
+    "evaluate_histogram_quality",
+    "compare_algorithms",
     "plot_bimodal_histogram",
     "plot_ground_truth_comparison",
+    "plot_cross_algorithm_grid",
+    "make_cross_algorithm_sinos",
     "HistogramResult",
     "GMMFitResult",
+    "ArtifactSignatures",
+    "ClusterQualityMetrics",
 ]
 
 
@@ -1008,6 +1014,774 @@ def _draw_recon_panel(
 # ──────────────────────────────────────────────────────────────────────────────
 # Internal helpers
 # ──────────────────────────────────────────────────────────────────────────────
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Cross-algorithm comparison grid
+# ──────────────────────────────────────────────────────────────────────────────
+
+def plot_cross_algorithm_grid(
+    phantom,
+    xray_sinos,
+    neutron_sinos,
+    algorithm_pairs,
+    bins=128,
+    log_scale=True,
+    cmap="inferno",
+    show_marginals=True,
+    show_gt_markers=True,
+    show_metrics=True,
+    energy_idx=6,
+    figsize_per_panel=(5.2, 4.8),
+    suptitle="Cross-algorithm bimodal histogram comparison",
+    ncols=None,
+):
+    """
+    Plot a grid of bimodal histograms, one panel per (X-ray algorithm, neutron
+    algorithm) combination specified in *algorithm_pairs*.
+
+    Each panel reconstructs the X-ray sinogram with *alg_x* and the neutron
+    sinogram with *alg_n* independently, then builds ``H(mu_x, mu_n)`` from
+    the two resulting volumes.  This isolates the contribution of each
+    modality's reconstruction algorithm to the histogram structure.
+
+    Parameters
+    ----------
+    phantom : PhantomData
+        Provides ground-truth material positions, label volume, and voxel_cm.
+
+    xray_sinos : dict {str -> dict}
+        Pre-computed X-ray sinogram dicts keyed by algorithm name.
+        All values are sinogram dicts as returned by ``project_xray()``
+        (keys: ``sino_lam``, ``angles_deg``, ``voxel_cm``, …).
+        Typically every value is the **same** sinogram dict — the algorithm
+        name is only used to select which reconstruction algorithm to run.
+        Use :func:`make_cross_algorithm_sinos` to build this automatically.
+
+    neutron_sinos : dict {str -> dict}
+        Same structure for the neutron channel.
+
+    algorithm_pairs : list of (alg_x, alg_n) tuples
+        Each tuple defines one grid panel.  Duplicates are ignored.
+        Example::
+
+            [("FBP",  "FBP"),
+             ("FBP",  "SIRT"),
+             ("SIRT", "FBP"),
+             ("SIRT", "SIRT"),
+             ("SART", "SART")]
+
+    bins : int
+        Histogram bins per axis.
+
+    log_scale : bool
+        Logarithmic colour scale on the 2-D panels.
+
+    cmap : str
+        Matplotlib colourmap.
+
+    show_marginals : bool
+        Attach log-count marginal histograms to each panel.
+
+    show_gt_markers : bool
+        Overlay white diamond markers at ground-truth material positions on
+        every panel.
+
+    show_metrics : bool
+        Compute Davies-Bouldin index and mean centroid error for each panel
+        and append to the panel title as
+        ``"DB=X.XXX  CE=X.XXXX cm^-1"``.
+
+    energy_idx : int
+        Energy bin index for the X-ray ground-truth mu_x (default 6 = 80 keV).
+
+    figsize_per_panel : (float, float)
+        Size of each histogram panel in inches.
+
+    suptitle : str
+        Figure super-title.
+
+    ncols : int or None
+        Grid columns.  ``None`` uses ``ceil(sqrt(n_panels))``.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+
+    histograms : dict {(alg_x, alg_n) -> HistogramResult}
+        All computed histograms for downstream analysis, e.g.
+        :func:`evaluate_histogram_quality`.
+
+    Raises
+    ------
+    KeyError
+        If an algorithm pair requests a key absent from *xray_sinos* or
+        *neutron_sinos*.
+    ValueError
+        If *algorithm_pairs* is empty.
+
+    Examples
+    --------
+    ::
+
+        from neutron_xray_sim import DualModalitySimulation, ArtifactConfig
+        from neutron_xray_sim.histogram import (
+            make_cross_algorithm_sinos, plot_cross_algorithm_grid
+        )
+
+        sim = DualModalitySimulation(preset="composite", N=64, n_angles=120)
+        sim._ensure_sinograms()
+
+        algs  = ["FBP", "SIRT", "SART", "CGLS"]
+        pairs = [(ax, an) for ax in algs for an in algs]   # full 4x4 grid
+
+        x_sinos, n_sinos = make_cross_algorithm_sinos(sim.phantom, algs)
+
+        fig, hists = plot_cross_algorithm_grid(
+            phantom         = sim.phantom,
+            xray_sinos      = x_sinos,
+            neutron_sinos   = n_sinos,
+            algorithm_pairs = pairs,
+            suptitle        = "4x4 algorithm comparison — composite phantom",
+        )
+        fig.savefig("cross_alg_grid.png", dpi=150, bbox_inches="tight")
+    """
+    import warnings as _warn
+
+    from .reconstructor import reconstruct as _recon
+
+    # ── Deduplicate pairs, preserve order ─────────────────────────────────────
+    seen, unique_pairs = set(), []
+    for p in algorithm_pairs:
+        if p not in seen:
+            seen.add(p)
+            unique_pairs.append(p)
+    pairs = unique_pairs
+
+    n_panels = len(pairs)
+    if n_panels == 0:
+        raise ValueError("algorithm_pairs is empty.")
+
+    # ── Validate keys ─────────────────────────────────────────────────────────
+    for alg_x, alg_n in pairs:
+        if alg_x not in xray_sinos:
+            raise KeyError(
+                f"alg_x='{alg_x}' not found in xray_sinos. "
+                f"Available: {list(xray_sinos)}"
+            )
+        if alg_n not in neutron_sinos:
+            raise KeyError(
+                f"alg_n='{alg_n}' not found in neutron_sinos. "
+                f"Available: {list(neutron_sinos)}"
+            )
+
+    # ── GT positions ──────────────────────────────────────────────────────────
+    materials  = phantom.materials
+    n_mat      = len(materials)
+    mu_x_gt    = np.array([m._mu_x_table[energy_idx] for m in materials])
+    mu_n_gt    = np.array([m.mu_n for m in materials])
+    gt_colours = plt.cm.Set1(np.linspace(0, 0.9, n_mat))
+
+    # ── Reconstruct, caching by (modality, algorithm) ─────────────────────────
+    _vol_cache = {}
+
+    def _get_vol(modality, alg, sino):
+        key = (modality, alg)
+        if key not in _vol_cache:
+            _vol_cache[key] = _recon(sino, algorithm=alg,
+                                     filter_name="shepp-logan",
+                                     remove_rings=True, clip_negative=True,
+                                     use_astra=True)
+        return _vol_cache[key]
+
+    # ── Build histograms ──────────────────────────────────────────────────────
+    pair_hists = {}
+    for alg_x, alg_n in pairs:
+        vx = _get_vol("X", alg_x, xray_sinos[alg_x])
+        vn = _get_vol("N", alg_n, neutron_sinos[alg_n])
+        pair_hists[(alg_x, alg_n)] = compute_bimodal_histogram(vx, vn, bins=bins)
+
+    # ── Optional per-panel metrics ────────────────────────────────────────────
+    panel_metrics = {}
+    if show_metrics:
+        # evaluate_histogram_quality may not be defined yet in the uploaded
+        # version; catch gracefully
+        _eqh = globals().get("evaluate_histogram_quality")
+        for pair, hist in pair_hists.items():
+            if _eqh is not None:
+                try:
+                    panel_metrics[pair] = _eqh(
+                        hist, phantom,
+                        n_components=n_mat,
+                        energy_idx=energy_idx,
+                        exclude_air=True,
+                    )
+                except Exception as exc:
+                    _warn.warn(f"Metrics failed for {pair}: {exc}")
+                    panel_metrics[pair] = None
+            else:
+                panel_metrics[pair] = None
+
+    # ── Shared axis limits ────────────────────────────────────────────────────
+    x_max = max(
+        max(h.x_edges[-1] for h in pair_hists.values()),
+        float(mu_x_gt.max()) * 1.08,
+    )
+    n_max = max(
+        max(h.n_edges[-1] for h in pair_hists.values()),
+        float(mu_n_gt.max()) * 1.08,
+    )
+    shared_extent = [0.0, x_max, 0.0, n_max]
+
+    # ── Figure grid ───────────────────────────────────────────────────────────
+    if ncols is None:
+        ncols = max(1, int(np.ceil(np.sqrt(n_panels))))
+    nrows = int(np.ceil(n_panels / ncols))
+
+    fig = plt.figure(
+        figsize=(figsize_per_panel[0] * ncols, figsize_per_panel[1] * nrows),
+        constrained_layout=True,
+    )
+    if suptitle:
+        fig.suptitle(suptitle, fontsize=12)
+
+    subfigs = fig.subfigures(nrows, ncols, wspace=0.05, hspace=0.06)
+    # Normalise to 2-D array regardless of shape
+    subfigs = np.atleast_2d(subfigs)
+    if subfigs.ndim == 1:
+        subfigs = subfigs[np.newaxis, :]
+    subfigs_flat = subfigs.ravel()
+
+    # ── Draw each panel ───────────────────────────────────────────────────────
+    for panel_idx, (alg_x, alg_n) in enumerate(pairs):
+        hist = pair_hists[(alg_x, alg_n)]
+        m    = panel_metrics.get((alg_x, alg_n))
+
+        # Build title lines
+        title = f"X-ray: {alg_x}  |  Neutron: {alg_n}"
+        if m is not None:
+            nan = float("nan")
+            db  = m.davies_bouldin
+            ce  = m.mean_centroid_error
+            db_s = f"{db:.3f}" if db == db else "n/a"
+            ce_s = f"{ce:.4f}" if ce == ce else "n/a"
+            title = title + "\nDB=" + db_s + "  CE=" + ce_s + " cm\u207b\u00b9"
+
+        _draw_recon_panel(
+            subfigs_flat[panel_idx], hist, title,
+            log_scale      = log_scale,
+            cmap           = cmap,
+            show_marginals = show_marginals,
+            shared_extent  = shared_extent,
+            gt_mu_x        = mu_x_gt  if show_gt_markers else None,
+            gt_mu_n        = mu_n_gt  if show_gt_markers else None,
+            gt_colours     = gt_colours,
+            materials      = materials,
+        )
+
+    # Hide unused slots
+    for idx in range(n_panels, len(subfigs_flat)):
+        subfigs_flat[idx].set_visible(False)
+
+    return fig, pair_hists
+
+
+def make_cross_algorithm_sinos(
+    phantom,
+    algorithms,
+    n_angles=120,
+    angle_range_deg=180.0,
+    kVp=120.0,
+    filter_mm_Al=2.0,
+    filter_mm_Cu=0.0,
+    n_spectrum_bins=12,
+    I0=1e5,
+    cfg=None,
+    use_astra=True,
+):
+    """
+    Convenience wrapper: run one forward projection and return sinogram dicts
+    ready for :func:`plot_cross_algorithm_grid`.
+
+    Because reconstruction is the only thing that differs between grid panels,
+    a single forward projection is shared by all panels — no extra GPU memory
+    or compute is used for duplicate sinograms.
+
+    Parameters
+    ----------
+    phantom : PhantomData
+    algorithms : list of str
+        All algorithm names that will appear in any pair.  Only the unique
+        set matters; the returned dicts map every listed algorithm to the
+        **same** sinogram object.
+    n_angles : int
+    angle_range_deg : float
+    kVp : float
+    filter_mm_Al : float
+    filter_mm_Cu : float
+    n_spectrum_bins : int
+    I0 : float
+        Incident count for both modalities.
+    cfg : ArtifactConfig or None
+        If supplied, sinogram-domain artifacts are injected before returning.
+    use_astra : bool
+
+    Returns
+    -------
+    xray_sinos : dict {alg -> xray sinogram dict}
+    neutron_sinos : dict {alg -> neutron sinogram dict}
+
+    Examples
+    --------
+    ::
+
+        phantom = make_composite_phantom(N=64)
+        algs = ["FBP", "SIRT", "SART"]
+
+        x_sinos, n_sinos = make_cross_algorithm_sinos(phantom, algs)
+
+        pairs = [("FBP", "SIRT"), ("SIRT", "FBP"), ("SART", "SART")]
+        fig, hists = plot_cross_algorithm_grid(phantom, x_sinos, n_sinos, pairs)
+    """
+    from .projector import make_sinogram_pair
+    from .artifacts import inject_sinogram_artifacts
+
+    xray_sino, neutron_sino = make_sinogram_pair(
+        phantom,
+        n_angles        = n_angles,
+        angle_range_deg = angle_range_deg,
+        kVp             = kVp,
+        filter_mm_Al    = filter_mm_Al,
+        filter_mm_Cu    = filter_mm_Cu,
+        n_spectrum_bins = n_spectrum_bins,
+        I0_xray         = I0,
+        I0_neutron      = I0,
+        use_astra       = use_astra,
+    )
+
+    if cfg is not None:
+        import numpy as _np
+        xray_sino, neutron_sino = inject_sinogram_artifacts(
+            xray_sino, neutron_sino, cfg,
+            rng=_np.random.default_rng(seed=0),
+        )
+
+    # Share the same dict objects for all algorithms
+    unique = list(dict.fromkeys(algorithms))
+    xray_sinos    = {alg: xray_sino    for alg in unique}
+    neutron_sinos = {alg: neutron_sino for alg in unique}
+    return xray_sinos, neutron_sinos
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Cluster-quality metrics: centroid error, spread, Davies-Bouldin index
+# ──────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class ClusterQualityMetrics:
+    """
+    Quantitative quality metrics for bimodal histogram cluster structure,
+    evaluated against known ground-truth material positions from the phantom.
+
+    All per-material fields are dicts keyed by material name (str).
+
+    Attributes
+    ----------
+    centroid_errors : dict {mat_name -> float}  [cm^-1]
+        Euclidean distance in (mu_x, mu_n) space between the GMM component
+        matched to this material and its ground-truth position.
+        Perfect reconstruction → 0 for all materials.
+
+    sigma_x : dict {mat_name -> float}  [cm^-1]
+        Cluster standard deviation along the mu_x axis,
+        read from the GMM covariance diagonal: sqrt(Cov[0,0]).
+
+    sigma_n : dict {mat_name -> float}  [cm^-1]
+        Cluster standard deviation along mu_n: sqrt(Cov[1,1]).
+
+    mean_centroid_error : float  [cm^-1]
+        Mean centroid error across all matched (non-air) materials.
+        Lower is better.
+
+    davies_bouldin : float  (dimensionless, ≥ 0)
+        Davies-Bouldin index over matched clusters:
+            DB = (1/K) * sum_k  max_{j≠k}  (s_k + s_j) / d(c_k, c_j)
+        where s_k = sqrt(trace(Cov_k)/2) and d is Euclidean centroid distance.
+        Lower is better; 0 = perfect separation.
+
+    overlap_fractions : dict {(mat_a, mat_b) -> float}
+        For each pair of neighbouring materials (GT distance < 2 cm^-1),
+        the fraction of their combined voxels that are misclassified by the
+        GMM relative to the ground-truth label volume.
+        Empty dict when phantom.label_vol is unavailable.
+
+    n_matched : int
+        Number of material phases successfully matched to a GMM component.
+
+    gmm : GMMFitResult
+        The fitted GMM stored for downstream plotting.
+    """
+    centroid_errors:     Dict[str, float]
+    sigma_x:             Dict[str, float]
+    sigma_n:             Dict[str, float]
+    mean_centroid_error: float
+    davies_bouldin:      float
+    overlap_fractions:   Dict[Tuple[str, str], float]
+    n_matched:           int
+    gmm:                 "GMMFitResult"
+
+    def summary(self, indent: str = "  ") -> str:
+        """Return a compact human-readable summary string."""
+        lines = [
+            "ClusterQualityMetrics",
+            f"{indent}mean centroid error : {self.mean_centroid_error:.4f} cm^-1",
+            f"{indent}Davies-Bouldin index: {self.davies_bouldin:.4f}",
+            f"{indent}n_matched           : {self.n_matched}",
+            f"{indent}per-material centroid errors (cm^-1):",
+        ]
+        for name, err in sorted(self.centroid_errors.items()):
+            sx = self.sigma_x.get(name, float("nan"))
+            sn = self.sigma_n.get(name, float("nan"))
+            lines.append(
+                f"{indent}  {name:<18}: err={err:.4f}  "
+                f"sigma_x={sx:.4f}  sigma_n={sn:.4f}"
+            )
+        if self.overlap_fractions:
+            lines.append(f"{indent}overlap fractions:")
+            for (a, b), f in sorted(self.overlap_fractions.items()):
+                lines.append(f"{indent}  {a} / {b}: {f:.4f}")
+        return "\n".join(lines)
+
+
+def evaluate_histogram_quality(
+    hist: "HistogramResult",
+    phantom,
+    n_components: Optional[int] = None,
+    energy_idx: int = 6,
+    exclude_air: bool = True,
+    gmm_n_init: int = 5,
+    gmm_max_iter: int = 300,
+) -> "ClusterQualityMetrics":
+    """
+    Quantitatively evaluate bimodal histogram cluster quality against the
+    known ground-truth material positions from *phantom*.
+
+    Three complementary metrics are computed:
+
+    **1. Centroid error** (accuracy)
+        A Gaussian Mixture Model is fitted to the voxel-level
+        ``(mu_x, mu_n)`` pairs.  Each GMM component is matched to the
+        nearest unmatched ground-truth material by greedy nearest-neighbour
+        assignment.  The per-material centroid error is the Euclidean distance
+        between the matched GMM centroid and the true material position::
+
+            eps_k = sqrt((mu_x_hat - mu_x_GT)^2 + (mu_n_hat - mu_n_GT)^2)
+
+    **2. Cluster spread** (compactness)
+        sigma_x = sqrt(Cov[0,0]),  sigma_n = sqrt(Cov[1,1])
+        for each matched cluster.
+
+    **3. Davies-Bouldin index** (separability)
+        DB = (1/K) * sum_k  max_{j≠k}  (s_k + s_j) / d(c_k, c_j)
+        where s_k = sqrt(trace(Cov_k)/2).  Lower DB = better.
+
+    Parameters
+    ----------
+    hist          : HistogramResult from compute_bimodal_histogram()
+    phantom       : PhantomData (provides GT positions and label_vol)
+    n_components  : GMM components to fit.  Defaults to len(phantom.materials).
+    energy_idx    : energy bin for mu_x GT lookup (default 6 = 80 keV)
+    exclude_air   : exclude the air phase from centroid-error and DB metrics
+    gmm_n_init    : GMM random initialisations (higher = more robust)
+    gmm_max_iter  : maximum EM iterations
+
+    Returns
+    -------
+    ClusterQualityMetrics
+    """
+    try:
+        from sklearn.mixture import GaussianMixture
+    except ImportError:
+        raise ImportError(
+            "scikit-learn is required: pip install scikit-learn"
+        )
+
+    # ── Ground-truth positions ────────────────────────────────────────────────
+    materials    = phantom.materials
+    gt_positions = {}
+    for mat in materials:
+        if exclude_air and mat.name.lower() in ("air",):
+            continue
+        gt_positions[mat.name] = (
+            float(mat._mu_x_table[energy_idx]),
+            float(mat.mu_n),
+        )
+
+    n_mat_total = len(materials)
+    if n_components is None:
+        n_components = n_mat_total
+
+    # ── Fit GMM on voxel pairs ────────────────────────────────────────────────
+    vx = hist.vol_x_flat
+    vn = hist.vol_n_flat
+    MAX_SAMPLES = 500_000
+    if len(vx) > MAX_SAMPLES:
+        rng = np.random.default_rng(seed=42)
+        idx = rng.choice(len(vx), size=MAX_SAMPLES, replace=False)
+        vx_fit, vn_fit = vx[idx], vn[idx]
+    else:
+        vx_fit, vn_fit = vx, vn
+
+    pts = np.column_stack([vx_fit, vn_fit])
+
+    gm = GaussianMixture(
+        n_components=n_components,
+        covariance_type="full",
+        n_init=gmm_n_init,
+        max_iter=gmm_max_iter,
+        random_state=42,
+    )
+    gm.fit(pts)
+
+    gmm_means = gm.means_
+    gmm_covs  = gm.covariances_
+    gmm_wts   = gm.weights_
+
+    # ── Greedy nearest-neighbour matching ─────────────────────────────────────
+    gt_names  = list(gt_positions.keys())
+    gt_coords = np.array([gt_positions[n] for n in gt_names])
+
+    dist_mat = np.sqrt(
+        ((gt_coords[:, np.newaxis, :] - gmm_means[np.newaxis, :, :]) ** 2).sum(axis=2)
+    )
+
+    matched_gt: Dict[str, int] = {}
+    remaining_gt  = list(range(len(gt_names)))
+    remaining_gmm = list(range(n_components))
+    while remaining_gt and remaining_gmm:
+        sub      = dist_mat[np.ix_(remaining_gt, remaining_gmm)]
+        flat_idx = int(np.argmin(sub))
+        r, c     = divmod(flat_idx, len(remaining_gmm))
+        gt_idx   = remaining_gt[r]
+        gmm_idx  = remaining_gmm[c]
+        matched_gt[gt_names[gt_idx]] = gmm_idx
+        remaining_gt.remove(gt_idx)
+        remaining_gmm.remove(gmm_idx)
+
+    # ── Per-material metrics ──────────────────────────────────────────────────
+    centroid_errors: Dict[str, float] = {}
+    sigma_x_dict:   Dict[str, float] = {}
+    sigma_n_dict:   Dict[str, float] = {}
+
+    for name, gmm_idx in matched_gt.items():
+        mx_hat, mn_hat = gmm_means[gmm_idx]
+        mx_gt,  mn_gt  = gt_positions[name]
+        centroid_errors[name] = float(
+            np.sqrt((mx_hat - mx_gt) ** 2 + (mn_hat - mn_gt) ** 2)
+        )
+        sigma_x_dict[name] = float(np.sqrt(max(gmm_covs[gmm_idx][0, 0], 0.0)))
+        sigma_n_dict[name] = float(np.sqrt(max(gmm_covs[gmm_idx][1, 1], 0.0)))
+
+    mean_ce = float(np.mean(list(centroid_errors.values()))) if centroid_errors else 0.0
+
+    # ── Davies-Bouldin index ──────────────────────────────────────────────────
+    matched_idx = list(matched_gt.values())
+    K_db = len(matched_idx)
+    if K_db >= 2:
+        spreads = np.array([
+            float(np.sqrt(np.trace(gmm_covs[k]) / 2.0))
+            for k in matched_idx
+        ])
+        centres = gmm_means[matched_idx]
+        db_sum  = 0.0
+        for i in range(K_db):
+            worst = 0.0
+            for j in range(K_db):
+                if i == j:
+                    continue
+                d_ij = float(np.sqrt(((centres[i] - centres[j]) ** 2).sum()))
+                r_ij = (spreads[i] + spreads[j]) / (d_ij + 1e-12)
+                if r_ij > worst:
+                    worst = r_ij
+            db_sum += worst
+        davies_bouldin = db_sum / K_db
+    else:
+        davies_bouldin = float("nan")
+
+    # ── Overlap fractions ─────────────────────────────────────────────────────
+    overlap_fractions: Dict[Tuple[str, str], float] = {}
+    if hasattr(phantom, "label_vol") and phantom.label_vol is not None:
+        try:
+            pts_full = np.column_stack([vx, vn])
+            chunk    = 200_000
+            gmm_labels = np.empty(len(pts_full), dtype=np.int32)
+            for start in range(0, len(pts_full), chunk):
+                gmm_labels[start:start+chunk] = gm.predict(
+                    pts_full[start:start+chunk]
+                )
+            gt_labels = phantom.label_vol.ravel()
+
+            mat_name_to_idx = {m.name: i for i, m in enumerate(materials)}
+            gmm_to_mat_idx  = {
+                v: mat_name_to_idx[k]
+                for k, v in matched_gt.items()
+                if k in mat_name_to_idx
+            }
+
+            for name_a, gmm_idx_a in matched_gt.items():
+                mat_idx_a = mat_name_to_idx.get(name_a, -1)
+                for name_b, gmm_idx_b in matched_gt.items():
+                    if name_b <= name_a:
+                        continue
+                    mat_idx_b = mat_name_to_idx.get(name_b, -1)
+                    xa, na = gt_positions[name_a]
+                    xb, nb = gt_positions[name_b]
+                    if np.sqrt((xa-xb)**2 + (na-nb)**2) > 2.0:
+                        continue
+                    mask = np.isin(gt_labels, [mat_idx_a, mat_idx_b])
+                    if mask.sum() == 0:
+                        continue
+                    pred = gmm_labels[mask]
+                    true = gt_labels[mask]
+                    wrong = sum(
+                        gmm_to_mat_idx.get(int(pred[i]), -1) != int(true[i])
+                        for i in range(len(true))
+                    )
+                    overlap_fractions[(name_a, name_b)] = wrong / len(true)
+        except Exception as exc:
+            warnings.warn(f"Overlap fraction computation failed: {exc}")
+
+    # ── Package GMMFitResult ──────────────────────────────────────────────────
+    labels_full = np.full(len(vx), -1, dtype=np.int32)
+    try:
+        pts_full = np.column_stack([vx, vn])
+        chunk = 200_000
+        for start in range(0, len(pts_full), chunk):
+            labels_full[start:start+chunk] = gm.predict(pts_full[start:start+chunk])
+    except Exception:
+        pass
+
+    gmm_result = GMMFitResult(
+        n_components = n_components,
+        means        = gmm_means,
+        covariances  = gmm_covs,
+        weights      = gmm_wts,
+        labels_flat  = labels_full,
+        bic          = float(gm.bic(pts)),
+        aic          = float(gm.aic(pts)),
+    )
+
+    return ClusterQualityMetrics(
+        centroid_errors      = centroid_errors,
+        sigma_x              = sigma_x_dict,
+        sigma_n              = sigma_n_dict,
+        mean_centroid_error  = mean_ce,
+        davies_bouldin       = davies_bouldin,
+        overlap_fractions    = overlap_fractions,
+        n_matched            = len(matched_gt),
+        gmm                  = gmm_result,
+    )
+
+
+def compare_algorithms(
+    results: List,
+    phantom,
+    energy_idx: int = 6,
+    exclude_air: bool = True,
+    print_table: bool = True,
+) -> Dict[str, "ClusterQualityMetrics"]:
+    """
+    Evaluate cluster quality for a list of SimulationResult objects and
+    optionally print a formatted ASCII comparison table.
+
+    Parameters
+    ----------
+    results     : list of SimulationResult objects (must have .histogram and .tag)
+    phantom     : PhantomData (shared ground truth)
+    energy_idx  : X-ray energy index for mu_x lookup (default 6 = 80 keV)
+    exclude_air : exclude air from metrics
+    print_table : print a formatted table to stdout
+
+    Returns
+    -------
+    dict {result.tag -> ClusterQualityMetrics}
+
+    Examples
+    --------
+    ::
+
+        metrics = compare_algorithms([r_fbp, r_sirt, r_sart], phantom=phantom)
+    """
+    n_mat = len(phantom.materials)
+    metrics_dict: Dict[str, "ClusterQualityMetrics"] = {}
+
+    for r in results:
+        tag  = getattr(r, "tag", str(r))
+        hist = r.histogram if hasattr(r, "histogram") else r
+        m    = evaluate_histogram_quality(
+            hist, phantom,
+            n_components=n_mat,
+            energy_idx=energy_idx,
+            exclude_air=exclude_air,
+        )
+        metrics_dict[tag] = m
+
+    if print_table:
+        _print_quality_table(metrics_dict)
+
+    return metrics_dict
+
+
+def _print_quality_table(
+    metrics_dict: Dict[str, "ClusterQualityMetrics"],
+) -> None:
+    """Print a formatted ASCII comparison table of cluster quality metrics."""
+    if not metrics_dict:
+        return
+
+    all_mats = sorted({
+        name
+        for m in metrics_dict.values()
+        for name in m.centroid_errors
+    })
+
+    col_w  = 22
+    mat_w  = 14
+    sep    = "\u2500" * (col_w + 2 + (mat_w + 2) * len(all_mats) + 14 + 10)
+    hdr    = "".join(f"  {n[:mat_w]:<{mat_w}}" for n in all_mats)
+
+    print()
+    print("  Cluster quality \u2014 centroid error per material [cm^-1]")
+    print(sep)
+    _h1 = "Algorithm / Tag"
+    _h2 = "Mean err"
+    _h3 = "DB index"
+    print(f"  {_h1:<{col_w}}{hdr}  {_h2:>10}  {_h3:>10}")
+    print(sep)
+    for tag, m in metrics_dict.items():
+        row = f"  {tag[:col_w]:<{col_w}}"
+        for name in all_mats:
+            err = m.centroid_errors.get(name, float("nan"))
+            row += f"  {err:>{mat_w}.4f}"
+        row += f"  {m.mean_centroid_error:>10.4f}  {m.davies_bouldin:>10.4f}"
+        print(row)
+    print(sep)
+
+    print()
+    print("  Cluster spread \u2014 sigma_x / sigma_n [cm^-1]")
+    print(sep)
+    print(f"  {_h1:<{col_w}}{hdr}")
+    print(sep)
+    for tag, m in metrics_dict.items():
+        row = f"  {tag[:col_w]:<{col_w}}"
+        for name in all_mats:
+            sx = m.sigma_x.get(name, float("nan"))
+            sn = m.sigma_n.get(name, float("nan"))
+            row += f"  {sx:.3f}/{sn:.3f}  "
+        print(row)
+    print(sep)
+    print()
+
 
 def _compute_precision_chol(covariances: np.ndarray) -> np.ndarray:
     """Compute precision Cholesky for sklearn GaussianMixture warm-start."""

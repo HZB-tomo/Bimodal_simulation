@@ -1,0 +1,24 @@
+# neutron_xray_sim requirements
+# Core (CPU-only operation)
+numpy>=1.24
+scipy>=1.10
+scikit-image>=0.20
+scikit-learn>=1.2
+matplotlib>=3.7
+
+# GPU-accelerated projection and reconstruction (strongly recommended for N >= 256)
+# Install via conda:  conda install -c astra-toolbox -c nvidia astra-toolbox
+# astra-toolbox>=1.9
+
+# Gridrec reconstruction (optional, via TomoPy)
+# conda install -c conda-forge tomopy
+# tomopy>=1.14
+
+# Notebook
+jupyter>=1.0
+ipython>=8.0
+
+# Documentation (optional)
+# sphinx>=7
+# sphinx-rtd-theme
+# myst-parser

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name            = "neutron_xray_sim"
+version         = "1.1.0"
+description     = "Dual-modality neutron/X-ray CT simulation and bimodal histogram analysis"
+readme          = "README.md"
+requires-python = ">=3.9"
+license         = {text = "MIT"}
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "scikit-image>=0.20",
+    "scikit-learn>=1.2",
+    "matplotlib>=3.7",
+]
+
+[project.optional-dependencies]
+gpu     = ["astra-toolbox>=1.9"]
+gridrec = ["tomopy>=1.14"]
+docs    = ["sphinx>=7", "sphinx-rtd-theme", "myst-parser"]
+dev     = ["pytest", "jupyter"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["neutron_xray_sim*"]

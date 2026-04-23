@@ -98,6 +98,104 @@ def _astra_project_2d(vol2d: np.ndarray, angles_rad: np.ndarray) -> np.ndarray:
 # X-ray projector
 # ──────────────────────────────────────────────────────────────────────────────
 
+
+def _build_xray_mu_volume(phantom: PhantomData, energy_keV: float) -> np.ndarray:
+    """
+    Build 3-D X-ray attenuation volume at a single energy.
+
+    Parameters
+    ----------
+    phantom     : PhantomData
+    energy_keV  : X-ray energy [keV]
+
+    Returns
+    -------
+    mu_vol      : (N, N, N) attenuation coefficients [cm^-1]
+    """
+    N = phantom.N
+    mu_vol = np.zeros((N, N, N), dtype=np.float32)
+
+    for m_idx, mat in enumerate(phantom.materials):
+        mask = phantom.label_vol == m_idx
+        if mask.any():
+            mu_vol[mask] = mat.mu_x_at(energy_keV)
+
+    return mu_vol
+
+
+def project_xray_monochromatic(
+    phantom: PhantomData,
+    angles_deg: np.ndarray,
+    energy_keV: float,
+    use_astra: bool = True,
+    I0: float = 1e5,
+) -> dict:
+    """
+    Compute monochromatic X-ray sinograms.
+
+    Uses Beer-Lambert law at a single X-ray energy:
+        I = exp(-mu(E) * L)
+
+    Parameters
+    ----------
+    phantom      : PhantomData object
+    angles_deg   : 1-D array of projection angles [deg]
+    energy_keV   : monochromatic X-ray energy [keV]
+    use_astra    : use ASTRA GPU projection if available
+    I0           : incident photon count (for Poisson noise later)
+
+    Returns
+    -------
+    dict with keys:
+        'sino_lam'   : (n_angles, N, N) log-attenuation sinogram
+        'sino_trans' : (n_angles, N, N) transmission sinogram [0..1]
+        'angles_deg' : copy of angles_deg
+        'energy_keV' : monochromatic energy
+        'I0'         : incident photon count
+    """
+    N = phantom.N
+    dx = phantom.voxel_cm
+    n_angles = len(angles_deg)
+    angles_rad = np.radians(angles_deg)
+
+    sino_trans = np.zeros((n_angles, N, N), dtype=np.float32)
+    use_gpu = use_astra and ASTRA_OK
+
+    mu_vol = _build_xray_mu_volume(phantom, energy_keV)
+
+    if use_gpu:
+        import astra
+        vol_geom = astra.create_vol_geom(N, N)
+        proj_geom = astra.create_proj_geom("parallel", 1.0, N, angles_rad)
+        proj_id = astra.create_projector("cuda", proj_geom, vol_geom)
+
+        for s_idx in range(N):
+            _, sino_slice = astra.create_sino(mu_vol[s_idx], proj_id)
+            sino_trans[:, s_idx, :] = np.exp(-sino_slice * dx)
+
+        astra.projector.delete(proj_id)
+
+    else:
+        if use_astra and not ASTRA_OK:
+            warnings.warn("ASTRA not available — using NumPy fallback (slower).")
+
+        for a_idx, angle in enumerate(angles_deg):
+            proj2d = _ray_sum_numpy(mu_vol, angle)
+            sino_trans[a_idx] = np.exp(-proj2d * dx)
+
+    eps = 1.0 / (10 * I0)
+    sino_lam = -np.log(np.clip(sino_trans, eps, 1.0))
+
+    return {
+        "sino_lam": sino_lam,
+        "sino_trans": sino_trans,
+        "angles_deg": angles_deg,
+        "energy_keV": energy_keV,
+        "I0": I0,
+        "voxel_cm": phantom.voxel_cm,
+    }
+
+
 def project_xray(
     phantom: PhantomData,
     angles_deg: np.ndarray,
@@ -156,16 +254,10 @@ def project_xray(
 
         for e_idx, (E, W) in enumerate(zip(energies_keV, weights)):
             # Build the attenuation volume at this energy  [cm⁻¹]
-            mu_vol = np.zeros((N, N, N), dtype=np.float32)
-            for m_idx, mat in enumerate(phantom.materials):
-                mask = phantom.label_vol == m_idx
-                if mask.any():
-                    mu_vol[mask] = mat.mu_x_at(E)
 
-            for s_idx in range(N):
-                _, sino_slice = astra.create_sino(mu_vol[s_idx], proj_id)
-                # sino_slice: (n_angles, N_det); multiply by voxel size → optical depth
-                sino_trans[:, s_idx, :] += W * np.exp(-sino_slice * dx)
+            mu_vol = _build_xray_mu_volume(phantom, E)
+            
+            
 
         astra.projector.delete(proj_id)
 
@@ -197,6 +289,8 @@ def project_xray(
         "I0":         I0,
         "voxel_cm":   phantom.voxel_cm,
     }
+
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -309,10 +403,12 @@ def make_sinogram_pair(
     phantom: PhantomData,
     n_angles: int = 180,
     angle_range_deg: float = 180.0,
+    xray_mode: str = "polychromatic",
     kVp: float = 120.0,
     filter_mm_Al: float = 2.0,
     filter_mm_Cu: float = 0.0,
     n_spectrum_bins: int = 12,
+    xray_energy_keV: float | None = None,
     I0_xray: float = 1e5,
     I0_neutron: float = 1e5,
     use_astra: bool = True,
@@ -326,10 +422,12 @@ def make_sinogram_pair(
     phantom          : PhantomData
     n_angles         : number of projection angles
     angle_range_deg  : total angular range (180 = half-scan, 360 = full)
-    kVp              : X-ray tube voltage [kV]
-    filter_mm_Al     : aluminium pre-filter [mm]
-    filter_mm_Cu     : copper pre-filter [mm]
+    xray_mode        : 'polychromatic' or 'monochromatic'
+    kVp              : X-ray tube voltage [kV] for polychromatic mode
+    filter_mm_Al     : aluminium pre-filter [mm] for polychromatic mode
+    filter_mm_Cu     : copper pre-filter [mm] for polychromatic mode
     n_spectrum_bins  : polychromatic energy bins
+    xray_energy_keV  : monochromatic X-ray energy [keV]
     I0_xray          : incident X-ray photon count
     I0_neutron       : incident neutron count
     use_astra        : use GPU projection if available
@@ -337,24 +435,67 @@ def make_sinogram_pair(
 
     Returns
     -------
-    (xray_sino_dict, neutron_sino_dict)  — see project_xray / project_neutron
+    (xray_sino_dict, neutron_sino_dict) — see project_xray /
+    project_xray_monochromatic / project_neutron
     """
     angles = np.linspace(0.0, angle_range_deg, n_angles, endpoint=False)
 
     _backend = "ASTRA GPU" if (use_astra and ASTRA_OK) else "NumPy CPU"
     print(f"[projector] Projecting {n_angles} angles ({_backend}) …")
 
-    print("  → X-ray (polychromatic) …")
-    xray = project_xray(
-        phantom, angles,
-        kVp=kVp, filter_mm_Al=filter_mm_Al, filter_mm_Cu=filter_mm_Cu,
-        n_spectrum_bins=n_spectrum_bins, use_astra=use_astra, I0=I0_xray,
-    )
+    if xray_mode == "polychromatic":
+        print("  → X-ray (polychromatic) …")
+        xray = project_xray(
+            phantom,
+            angles,
+            kVp=kVp,
+            filter_mm_Al=filter_mm_Al,
+            filter_mm_Cu=filter_mm_Cu,
+            n_spectrum_bins=n_spectrum_bins,
+            use_astra=use_astra,
+            I0=I0_xray,
+        )
+
+    elif xray_mode == "monochromatic":
+        if xray_energy_keV is None:
+            raise ValueError(
+                "xray_energy_keV must be provided when "
+                "xray_mode='monochromatic'."
+            )
+
+        if (
+            kVp != 120.0
+            or filter_mm_Al != 2.0
+            or filter_mm_Cu != 0.0
+            or n_spectrum_bins != 12
+        ):
+            warnings.warn(
+                "kVp, filter_mm_Al, filter_mm_Cu, and n_spectrum_bins "
+                "are ignored when xray_mode='monochromatic'."
+            )
+
+        print(f"  → X-ray (monochromatic, {xray_energy_keV:.1f} keV) …")
+        xray = project_xray_monochromatic(
+            phantom,
+            angles,
+            energy_keV=xray_energy_keV,
+            use_astra=use_astra,
+            I0=I0_xray,
+        )
+
+    else:
+        raise ValueError(
+            f"Unknown xray_mode={xray_mode!r}. "
+            "Use 'polychromatic' or 'monochromatic'."
+        )
 
     print("  → Neutron (thermal) …")
     neutron = project_neutron(
-        phantom, angles,
-        use_astra=use_astra, I0=I0_neutron, scatter_D_over_L=scatter_D_over_L,
+        phantom,
+        angles,
+        use_astra=use_astra,
+        I0=I0_neutron,
+        scatter_D_over_L=scatter_D_over_L,
     )
 
     print("[projector] Done.")

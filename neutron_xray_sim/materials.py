@@ -14,6 +14,13 @@ from __future__ import annotations
 import numpy as np
 from dataclasses import dataclass
 from typing import Dict
+import re
+from pathlib import Path
+
+
+XRAY_DATA_DIR = Path(__file__).resolve().parent / "lib" / "xray_data"
+
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Standard X-ray energy grid (keV).  The two "extra" points at 70 and 90 keV
@@ -22,6 +29,188 @@ from typing import Dict
 XRAY_E_KEV = np.array(
     [20, 30, 40, 50, 60, 70, 80, 90, 100, 120, 150, 200, 300], dtype=float
 )
+
+
+AVOGADRO = 6.02214076e23
+BARN_CM2 = 1e-24
+
+ATOMIC_MASS = {
+    "H": 1.00794,
+    "Li": 6.941,
+    "C": 12.0107,
+    "O": 15.999,
+    "P": 30.973761998,
+    "Fe": 55.845,
+    "Co": 58.933194,
+    "Ni": 58.6934,
+    "Mn": 54.938044,
+}
+
+# Microscopic thermal-neutron cross sections [barn]
+# These should be the elemental values you choose to adopt consistently.
+NEUTRON_XS = {
+    "H":  {"abs": 0.3326, "coh": 1.7568, "inc": 80.27},
+    "Li": {"abs": 70.5,   "coh": 0.454,  "inc": 0.92},
+    "C":  {"abs": 0.0035, "coh": 5.551,  "inc": 0.001},
+    "O":  {"abs": 0.00019,"coh": 4.232,  "inc": 0.0008},
+    "P":  {"abs": 0.172,  "coh": 3.307,  "inc": 0.005},
+    "Fe": {"abs": 2.56,   "coh": 11.22,  "inc": 0.40},
+    "Co": {"abs": 37.18,  "coh": 0.779,  "inc": 4.8},
+    "Ni": {"abs": 4.49,   "coh": 13.3,   "inc": 5.2},
+    "Mn": {"abs": 13.3,   "coh": 2.15,   "inc": 0.40},
+}
+
+# Elemental mass attenuation coefficients [cm^2/g] at XRAY_E_KEV.
+# You must fill these arrays from your chosen XCOM export or source file.
+#[20, 30, 40, 50, 60, 70, 80, 90, 100, 120, 150, 200, 300]
+
+
+'''
+To create this programatically using NIST dataset .
+
+XRAY_MASS_ATTEN = {
+    "H":  np.array([ ... ], dtype=float),
+    "Li": np.array([ ... ], dtype=float),
+    "C":  np.array([ ... ], dtype=float),
+    "O":  np.array([ ... ], dtype=float),
+    "P":  np.array([ ... ], dtype=float),
+    "Fe": np.array([ ... ], dtype=float),
+    "Co": np.array([ ... ], dtype=float),
+    "Ni": np.array([ ... ], dtype=float),
+    "Mn": np.array([ ... ], dtype=float),
+}
+
+'''
+
+def _parse_xcom_txt(filepath: Path):
+    """
+    Parse NIST XCOM text file.
+
+    Returns
+    -------
+    energies_keV : np.ndarray
+    mu_over_rho  : np.ndarray   (Total attenuation WITH coherent scattering)
+    """
+    energies = []
+    mu_vals = []
+
+    with open(filepath, "r") as f:
+        for line in f:
+            parts = line.strip().split()
+
+            # skip header / malformed lines
+            if len(parts) < 8:
+                continue
+
+            try:
+                energy_mev = float(parts[0])
+                mu_total_with_coh = float(parts[6])  # <-- THIS COLUMN
+            except ValueError:
+                continue
+
+            energies.append(energy_mev * 1000.0)  # MeV → keV
+            mu_vals.append(mu_total_with_coh)
+
+    return np.array(energies), np.array(mu_vals)
+
+
+def _element_mu_over_rho(element: str) -> np.ndarray:
+    """
+    Return μ/ρ for one element on XRAY_E_KEV grid.
+    """
+    filepath = XRAY_DATA_DIR / f"{element}.txt"
+
+    if not filepath.exists():
+        raise FileNotFoundError(f"Missing X-ray data file: {filepath}")
+
+    energies, mu = _parse_xcom_txt(filepath)
+
+    # interpolate onto simulation grid
+    return np.interp(XRAY_E_KEV, energies, mu)
+
+
+def build_xray_mass_atten():
+    elements = ["H", "Li", "C", "O", "P", "Fe", "Co", "Ni", "Mn"]
+
+    data = {}
+    for el in elements:
+        data[el] = _element_mu_over_rho(el)
+
+    return data
+
+XRAY_MASS_ATTEN = build_xray_mass_atten()
+
+
+
+_FORMULA_RE = re.compile(r"([A-Z][a-z]?)([0-9]*\.?[0-9]*)")
+
+def parse_formula(formula: str) -> Dict[str, float]:
+    comp: Dict[str, float] = {}
+    for elem, count_str in _FORMULA_RE.findall(formula):
+        count = float(count_str) if count_str else 1.0
+        comp[elem] = comp.get(elem, 0.0) + count
+    if not comp:
+        raise ValueError(f"Could not parse formula '{formula}'")
+    return comp
+
+def material_from_formula(
+    name: str,
+    symbol: str,
+    formula: str,
+    density_gcc: float,
+    color: str = "#888888",
+    incoherent_scale: float = 1.0,
+) -> Material:
+    """
+    Build a Material from chemical formula + density.
+
+    Parameters
+    ----------
+    incoherent_scale
+        Optional scale factor for the incoherent neutron term.
+        Leave at 1.0 for dense inorganic solids.
+        For H-rich imaging-effective materials, you may reduce or tune it.
+    """
+    comp = parse_formula(formula)
+
+    # Molar mass [g/mol]
+    molar_mass = sum(ATOMIC_MASS[el] * n for el, n in comp.items())
+
+    # Mass fractions for X-ray mixture rule
+    mass_fracs = {
+        el: (ATOMIC_MASS[el] * n) / molar_mass
+        for el, n in comp.items()
+    }
+
+    # X-ray: mu/rho mix rule, then mu = rho * mu/rho
+    mu_over_rho = np.zeros_like(XRAY_E_KEV, dtype=float)
+    for el, w in mass_fracs.items():
+        mu_over_rho += w * XRAY_MASS_ATTEN[el]
+    mu_x = density_gcc * mu_over_rho
+
+    # Neutron microscopic cross sections per formula unit [barn]
+    sigma_abs = sum(comp[el] * NEUTRON_XS[el]["abs"] for el in comp)
+    sigma_coh = sum(comp[el] * NEUTRON_XS[el]["coh"] for el in comp)
+    sigma_inc = sum(comp[el] * NEUTRON_XS[el]["inc"] for el in comp)
+
+    # Number density of formula units [1/cm^3]
+    n_formula = density_gcc * AVOGADRO / molar_mass
+
+    # Macroscopic cross sections [cm^-1]
+    mu_abs = n_formula * sigma_abs * BARN_CM2
+    mu_coh = n_formula * sigma_coh * BARN_CM2
+    mu_inc = n_formula * sigma_inc * BARN_CM2 * incoherent_scale
+
+    return Material(
+        name=name,
+        symbol=symbol,
+        density_gcc=density_gcc,
+        mu_n_abs=mu_abs,
+        mu_n_coh=mu_coh,
+        mu_n_inc=mu_inc,
+        _mu_x_table=np.asarray(mu_x, dtype=float),
+        color=color,
+    )
 
 
 @dataclass
@@ -272,8 +461,79 @@ MATERIALS: Dict[str, Material] = {
         mu_x_list=[215., 66.2, 28.2, 14.1, 7.97, 5.09,
                    3.25, 2.43, 1.97, 1.41, 1.05, 0.862, 0.713],
         color="#BBBB44",
-    ),
+    ), 
 }
+
+
+MATERIALS.update({
+
+    "graphite": material_from_formula(
+        name="Graphite",
+        symbol="Gr",
+        formula="C",
+        density_gcc=2.26,
+        color="#444444",
+    ),
+
+    "lfp": material_from_formula(
+        name="Lithium Iron Phosphate",
+        symbol="LFP",
+        formula="LiFePO4",
+        density_gcc=3.60,
+        color="#6B8E23",
+    ),
+
+    "nmc811": material_from_formula(
+        name="NMC811",
+        symbol="NMC811",
+        formula="LiNi0.8Mn0.1Co0.1O2",
+        density_gcc=4.80,
+        color="#CC6677",
+    ),
+
+    "nmc532": material_from_formula(
+        name="NMC532",
+        symbol="NMC532",
+        formula="LiNi0.5Mn0.3Co0.2O2",
+        density_gcc=4.70,
+        color="#DD8899",
+    ),
+
+    "nmc622": material_from_formula(
+        name="NMC622",
+        symbol="NMC622",
+        formula="LiNi0.6Mn0.2Co0.2O2",
+        density_gcc=4.75,
+        color="#BB5577",
+    ),
+
+    "lco": material_from_formula(
+        name="Lithium Cobalt Oxide",
+        symbol="LCO",
+        formula="LiCoO2",
+        density_gcc=5.05,
+        color="#3366AA",
+    ),
+
+    # Dry separator approximations
+    "separator_pe": material_from_formula(
+        name="PE Separator",
+        symbol="PE-sep",
+        formula="C2H4",
+        density_gcc=0.94,
+        color="#EEEEAA",
+        incoherent_scale=0.35,   # optional "imaging-effective" reduction
+    ),
+
+    "separator_pp": material_from_formula(
+        name="PP Separator",
+        symbol="PP-sep",
+        formula="C3H6",
+        density_gcc=0.90,
+        color="#FFDDAA",
+        incoherent_scale=0.35,
+    ),
+})
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -343,3 +603,11 @@ LEAD      = MATERIALS["lead"]
 BONE      = MATERIALS["bone"]
 TUNGSTEN  = MATERIALS["tungsten"]
 ZINC      = MATERIALS["zinc"]
+GRAPHITE     = MATERIALS["graphite"]
+LFP          = MATERIALS["lfp"]
+NMC811       = MATERIALS["nmc811"]
+NMC532       = MATERIALS["nmc532"]
+NMC622       = MATERIALS["nmc622"]
+LCO          = MATERIALS["lco"]
+SEPARATOR_PE = MATERIALS["separator_pe"]
+SEPARATOR_PP = MATERIALS["separator_pp"]

@@ -202,18 +202,10 @@ def _project_cone_numpy(
 def _build_xray_mu_volume(phantom: PhantomData, energy_keV: float) -> np.ndarray:
     """
     Build 3-D X-ray attenuation volume at a single energy.
-
-    Parameters
-    ----------
-    phantom     : PhantomData
-    energy_keV  : X-ray energy [keV]
-
-    Returns
-    -------
-    mu_vol      : (N, N, N) attenuation coefficients [cm^-1]
+    Works for non-cubic phantoms.
     """
-    N = phantom.N
-    mu_vol = np.zeros((N, N, N), dtype=np.float32)
+    shape = phantom.label_vol.shape
+    mu_vol = np.zeros(shape, dtype=np.float32)
 
     for m_idx, mat in enumerate(phantom.materials):
         mask = phantom.label_vol == m_idx
@@ -310,127 +302,165 @@ def project_xray(
     SOD: float = 500.0,
 ) -> dict:
     """
-    Compute polychromatic X-ray sinograms (one per slice, stacked 3-D).
+    Compute polychromatic X-ray sinograms.
 
-    Beam hardening emerges naturally from the polychromatic summation:
-        I = Σ_E W(E) · exp(−μ_x(E) · L)
-    followed by the log-normalisation that the reconstruction assumes.
+    Supports non-cubic phantoms with shape:
+        phantom.label_vol.shape == (n_slices, n_x, n_det)
 
-    Parameters
-    ----------
-    phantom          : PhantomData object
-    angles_deg       : 1-D array of projection angles [°]
-    kVp              : tube peak voltage [kV]
-    filter_mm_Al     : pre-filter Al thickness [mm]
-    filter_mm_Cu     : pre-filter Cu thickness [mm]
-    n_spectrum_bins  : number of energy bins for polychromatic sum
-    use_astra        : use ASTRA GPU projection if available
-    I0               : incident photon count (for Poisson noise later)
-    geometry         : ``'parallel'`` (default) or ``'cone'``.
-                       In cone-beam mode the ASTRA ``fanflat`` geometry is used
-                       (GPU path) or a magnification-rescaling approximation
-                       (CPU fallback).
-    SDD              : source-to-detector distance [pixels].  Only used when
-                       ``geometry='cone'``.  Typical lab-CT value: 500–2000.
-    SOD              : source-to-object (iso-centre) distance [pixels].  Only
-                       used when ``geometry='cone'``.
-                       Magnification M = SDD / SOD.
-
-    Returns
-    -------
-    dict with keys:
-        'sino_lam'   : (n_angles, N, N) log-attenuation sinogram  [dimensionless]
-        'sino_trans' : (n_angles, N, N) raw transmission sinogram  [0..1]
-        'angles_deg' : copy of angles_deg
-        'spectrum'   : dict with 'energies_keV' and 'weights'
-        'I0'         : incident photon count
-        'geometry'   : ``'parallel'`` or ``'cone'``
-        'SDD'        : source-to-detector distance [pixels]  (cone only)
-        'SOD'        : source-to-object distance [pixels]    (cone only)
+    Output shape:
+        sino_trans, sino_lam == (n_angles, n_slices, n_det)
     """
-    energies_keV, weights = xray_spectrum(kVp, filter_mm_Al, filter_mm_Cu, n_spectrum_bins)
+    energies_keV, weights = xray_spectrum(
+        kVp,
+        filter_mm_Al,
+        filter_mm_Cu,
+        n_spectrum_bins,
+    )
 
-    N        = phantom.N
-    dx       = phantom.voxel_cm
+    if geometry not in {"parallel", "cone"}:
+        raise ValueError(
+            f"Unknown geometry={geometry!r}. Use 'parallel' or 'cone'."
+        )
+
+    label_shape = phantom.label_vol.shape
+    if len(label_shape) != 3:
+        raise ValueError(
+            f"phantom.label_vol must be 3-D, got shape {label_shape}."
+        )
+
+    n_slices, n_x, n_det = label_shape
+    dx = phantom.voxel_cm
     n_angles = len(angles_deg)
     angles_rad = np.radians(angles_deg)
 
-    # Sinogram: (n_angles, N_slice, N_det) = (n_angles, N, N)
-    sino_trans = np.zeros((n_angles, N, N), dtype=np.float32)
+    sino_trans = np.zeros((n_angles, n_slices, n_det), dtype=np.float32)
 
-    use_gpu = use_astra and ASTRA_OK
+    # ASTRA 2-D projector assumes square slices in this implementation.
+    # For rectangular / non-cubic phantoms, use the NumPy fallback.
+    astra_safe = (
+        ASTRA_OK
+        and use_astra
+        and n_x == n_det
+    )
 
-    if use_gpu:
-        # ── ASTRA path: project each energy bin, each slice ───────────────
+    if use_astra and not ASTRA_OK:
+        warnings.warn("ASTRA not available — using NumPy fallback.")
+
+    if use_astra and ASTRA_OK and not astra_safe:
+        warnings.warn(
+            "Non-square projection slices detected. "
+            "Using NumPy fallback because the current ASTRA path assumes "
+            "square 2-D slices."
+        )
+
+    if astra_safe:
         import astra
-        vol_geom  = astra.create_vol_geom(N, N)
+
+        vol_geom = astra.create_vol_geom(n_x, n_det)
+
         if geometry == "cone":
-            # Fan-beam (cone-beam central-slice) geometry via ASTRA
-            for e_idx, (E, W) in enumerate(zip(energies_keV, weights)):
+            for E, W in zip(energies_keV, weights):
                 mu_vol = _build_xray_mu_volume(phantom, E)
-                for s_idx in range(N):
+
+                for s_idx in range(n_slices):
                     fan_sino = _astra_project_cone_2d(
-                        mu_vol[s_idx], angles_rad, SDD, SOD
-                    )  # (n_angles, det_count)
-                    # Trim/pad to N detector columns to keep array shape uniform
+                        mu_vol[s_idx],
+                        angles_rad,
+                        SDD,
+                        SOD,
+                    )
+
                     det_count = fan_sino.shape[1]
-                    if det_count >= N:
-                        start = (det_count - N) // 2
-                        fan_sino = fan_sino[:, start:start + N]
+
+                    if det_count >= n_det:
+                        start = (det_count - n_det) // 2
+                        fan_sino = fan_sino[:, start:start + n_det]
                     else:
-                        pad = N - det_count
-                        fan_sino = np.pad(fan_sino,
-                                          ((0, 0), (pad // 2, pad - pad // 2)))
-                    sino_trans[:, s_idx, :] += W * np.exp(-fan_sino * dx)
+                        pad = n_det - det_count
+                        fan_sino = np.pad(
+                            fan_sino,
+                            ((0, 0), (pad // 2, pad - pad // 2)),
+                        )
+
+                    sino_trans[:, s_idx, :] += (
+                        W * np.exp(-fan_sino * dx)
+                    ).astype(np.float32)
+
         else:
-            # Parallel-beam geometry
-            proj_geom = astra.create_proj_geom("parallel", 1.0, N, angles_rad)
-            proj_id   = astra.create_projector("cuda", proj_geom, vol_geom)
+            proj_geom = astra.create_proj_geom(
+                "parallel",
+                1.0,
+                n_det,
+                angles_rad,
+            )
+            proj_id = astra.create_projector("cuda", proj_geom, vol_geom)
 
-            for e_idx, (E, W) in enumerate(zip(energies_keV, weights)):
-                # Build the attenuation volume at this energy  [cm⁻¹]
-                mu_vol = _build_xray_mu_volume(phantom, E)
+            try:
+                for E, W in zip(energies_keV, weights):
+                    mu_vol = _build_xray_mu_volume(phantom, E)
 
-            astra.projector.delete(proj_id)
+                    for s_idx in range(n_slices):
+                        _, sino_slice = astra.create_sino(
+                            mu_vol[s_idx].astype(np.float32),
+                            proj_id,
+                        )
+                        sino_trans[:, s_idx, :] += (
+                            W * np.exp(-sino_slice * dx)
+                        ).astype(np.float32)
+
+            finally:
+                astra.projector.delete(proj_id)
 
     else:
-        # ── NumPy fallback: rotate volume, sum along projection axis ─────
-        if use_astra and not ASTRA_OK:
-            warnings.warn("ASTRA not available — using NumPy fallback (slower).")
-
-        for e_idx, (E, W) in enumerate(zip(energies_keV, weights)):
-            mu_vol = np.zeros((N, N, N), dtype=np.float32)
-            for m_idx, mat in enumerate(phantom.materials):
-                mask = phantom.label_vol == m_idx
-                if mask.any():
-                    mu_vol[mask] = mat.mu_x_at(E)
+        for E, W in zip(energies_keV, weights):
+            mu_vol = _build_xray_mu_volume(phantom, E)
 
             if geometry == "cone":
                 for a_idx, angle in enumerate(angles_deg):
                     proj2d = _project_cone_numpy(mu_vol, angle, SDD, SOD)
-                    sino_trans[a_idx] += W * np.exp(-proj2d * dx)
+
+                    if proj2d.shape != (n_slices, n_det):
+                        raise ValueError(
+                            "Cone NumPy projection returned unexpected shape "
+                            f"{proj2d.shape}; expected {(n_slices, n_det)}."
+                        )
+
+                    sino_trans[a_idx] += (
+                        W * np.exp(-proj2d * dx)
+                    ).astype(np.float32)
+
             else:
                 for a_idx, angle in enumerate(angles_deg):
                     proj2d = _ray_sum_numpy(mu_vol, angle)
-                    sino_trans[a_idx] += W * np.exp(-proj2d * dx)
 
-    # Safe log-normalisation
+                    if proj2d.shape != (n_slices, n_det):
+                        raise ValueError(
+                            "Parallel NumPy projection returned unexpected "
+                            f"shape {proj2d.shape}; expected "
+                            f"{(n_slices, n_det)}."
+                        )
+
+                    sino_trans[a_idx] += (
+                        W * np.exp(-proj2d * dx)
+                    ).astype(np.float32)
+
     eps = 1.0 / (10 * I0)
     sino_lam = -np.log(np.clip(sino_trans, eps, 1.0))
 
     return {
-        "sino_lam":   sino_lam,
+        "sino_lam": sino_lam,
         "sino_trans": sino_trans,
         "angles_deg": angles_deg,
-        "spectrum":   {"energies_keV": energies_keV, "weights": weights},
-        "I0":         I0,
-        "voxel_cm":   phantom.voxel_cm,
-        "geometry":   geometry,
-        "SDD":        SDD,
-        "SOD":        SOD,
+        "spectrum": {
+            "energies_keV": energies_keV,
+            "weights": weights,
+        },
+        "I0": I0,
+        "voxel_cm": phantom.voxel_cm,
+        "geometry": geometry,
+        "SDD": SDD,
+        "SOD": SOD,
     }
-
-
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -447,93 +477,123 @@ def project_neutron(
     """
     Compute thermal-neutron sinograms.
 
-    The effective attenuation is:
-        μ_eff = μ_abs + μ_coh + μ_inc
+    Supports non-cubic phantoms with shape:
+        phantom.label_vol.shape == (n_slices, n_x, n_det)
 
-    The coherent and incoherent scatter components also produce a
-    "build-up" contamination signal that depends on the L/D collimation
-    ratio; this scatter contribution is modelled analytically and can be
-    injected via artifacts.py.
-
-    Parameters
-    ----------
-    phantom         : PhantomData object
-    angles_deg      : projection angles [°]
-    use_astra       : prefer ASTRA GPU if available
-    I0              : incident neutron count (for Poisson noise later)
-    scatter_D_over_L: collimation ratio D/L; larger → more geometric scatter
-                      (used as metadata; scatter injection is in artifacts.py)
-
-    Returns
-    -------
-    dict with keys:
-        'sino_lam'        : (n_angles, N, N) log-attenuation sinogram
-        'sino_trans'      : (n_angles, N, N) transmission  [0..1]
-        'sino_abs_lam'    : (n_angles, N, N) absorption-only component
-        'sino_scatter_lam': (n_angles, N, N) scatter-only component
-        'angles_deg'      : angles_deg
-        'I0'              : I0
-        'scatter_D_over_L': scatter_D_over_L
+    Output shape:
+        sino_trans, sino_lam == (n_angles, n_slices, n_det)
     """
-    N          = phantom.N
-    dx         = phantom.voxel_cm
-    n_angles   = len(angles_deg)
+    label_shape = phantom.label_vol.shape
+    if len(label_shape) != 3:
+        raise ValueError(
+            f"phantom.label_vol must be 3-D, got shape {label_shape}."
+        )
+
+    n_slices, n_x, n_det = label_shape
+    dx = phantom.voxel_cm
+    n_angles = len(angles_deg)
     angles_rad = np.radians(angles_deg)
 
-    use_gpu = use_astra and ASTRA_OK
+    for name, vol in [
+        ("mu_n_abs_vol", phantom.mu_n_abs_vol),
+        ("mu_n_coh_vol", phantom.mu_n_coh_vol),
+        ("mu_n_inc_vol", phantom.mu_n_inc_vol),
+    ]:
+        if vol.shape != label_shape:
+            raise ValueError(
+                f"phantom.{name} shape {vol.shape} does not match "
+                f"phantom.label_vol shape {label_shape}."
+            )
 
-    sino_abs_trans  = np.zeros((n_angles, N, N), dtype=np.float32)
-    sino_coh_trans  = np.zeros((n_angles, N, N), dtype=np.float32)
-    sino_inc_trans  = np.zeros((n_angles, N, N), dtype=np.float32)
+    sino_abs_trans = np.zeros((n_angles, n_slices, n_det), dtype=np.float32)
+    sino_coh_trans = np.zeros((n_angles, n_slices, n_det), dtype=np.float32)
+    sino_inc_trans = np.zeros((n_angles, n_slices, n_det), dtype=np.float32)
 
-    if use_gpu:
+    astra_safe = (
+        ASTRA_OK
+        and use_astra
+        and n_x == n_det
+    )
+
+    if use_astra and not ASTRA_OK:
+        warnings.warn("ASTRA not available — using NumPy fallback.")
+
+    if use_astra and ASTRA_OK and not astra_safe:
+        warnings.warn(
+            "Non-square projection slices detected. "
+            "Using NumPy fallback because the current ASTRA path assumes "
+            "square 2-D slices."
+        )
+
+    if astra_safe:
         import astra
-        vol_geom  = astra.create_vol_geom(N, N)
-        proj_geom = astra.create_proj_geom("parallel", 1.0, N, angles_rad)
-        proj_id   = astra.create_projector("cuda", proj_geom, vol_geom)
 
-        for vol, target in [
-            (phantom.mu_n_abs_vol, sino_abs_trans),
-            (phantom.mu_n_coh_vol, sino_coh_trans),
-            (phantom.mu_n_inc_vol, sino_inc_trans),
-        ]:
-            for s_idx in range(N):
-                _, sino_slice = astra.create_sino(vol[s_idx], proj_id)
-                target[:, s_idx, :] = np.exp(-sino_slice * dx)
+        vol_geom = astra.create_vol_geom(n_x, n_det)
+        proj_geom = astra.create_proj_geom(
+            "parallel",
+            1.0,
+            n_det,
+            angles_rad,
+        )
+        proj_id = astra.create_projector("cuda", proj_geom, vol_geom)
 
-        astra.projector.delete(proj_id)
+        try:
+            for vol, target in [
+                (phantom.mu_n_abs_vol, sino_abs_trans),
+                (phantom.mu_n_coh_vol, sino_coh_trans),
+                (phantom.mu_n_inc_vol, sino_inc_trans),
+            ]:
+                for s_idx in range(n_slices):
+                    _, sino_slice = astra.create_sino(
+                        vol[s_idx].astype(np.float32),
+                        proj_id,
+                    )
+                    target[:, s_idx, :] = np.exp(-sino_slice * dx)
+
+        finally:
+            astra.projector.delete(proj_id)
 
     else:
-        if use_astra and not ASTRA_OK:
-            warnings.warn("ASTRA not available — using NumPy fallback.")
-
         for a_idx, angle in enumerate(angles_deg):
-            sino_abs_trans[a_idx] = np.exp(
-                -_ray_sum_numpy(phantom.mu_n_abs_vol, angle) * dx)
-            sino_coh_trans[a_idx] = np.exp(
-                -_ray_sum_numpy(phantom.mu_n_coh_vol, angle) * dx)
-            sino_inc_trans[a_idx] = np.exp(
-                -_ray_sum_numpy(phantom.mu_n_inc_vol, angle) * dx)
+            abs_proj = _ray_sum_numpy(phantom.mu_n_abs_vol, angle)
+            coh_proj = _ray_sum_numpy(phantom.mu_n_coh_vol, angle)
+            inc_proj = _ray_sum_numpy(phantom.mu_n_inc_vol, angle)
 
-    # Total attenuation transmission
+            expected_shape = (n_slices, n_det)
+            for name, proj in [
+                ("absorption", abs_proj),
+                ("coherent", coh_proj),
+                ("incoherent", inc_proj),
+            ]:
+                if proj.shape != expected_shape:
+                    raise ValueError(
+                        f"{name} NumPy projection returned shape "
+                        f"{proj.shape}; expected {expected_shape}."
+                    )
+
+            sino_abs_trans[a_idx] = np.exp(-abs_proj * dx)
+            sino_coh_trans[a_idx] = np.exp(-coh_proj * dx)
+            sino_inc_trans[a_idx] = np.exp(-inc_proj * dx)
+
     sino_trans = sino_abs_trans * sino_coh_trans * sino_inc_trans
 
     eps = 1.0 / (10 * I0)
-    sino_lam         = -np.log(np.clip(sino_trans, eps, 1.0))
-    sino_abs_lam     = -np.log(np.clip(sino_abs_trans, eps, 1.0))
-    sino_scatter_lam = -np.log(np.clip(sino_coh_trans * sino_inc_trans, eps, 1.0))
+    sino_lam = -np.log(np.clip(sino_trans, eps, 1.0))
+    sino_abs_lam = -np.log(np.clip(sino_abs_trans, eps, 1.0))
+    sino_scatter_lam = -np.log(
+        np.clip(sino_coh_trans * sino_inc_trans, eps, 1.0)
+    )
 
     return {
-        "sino_lam":         sino_lam,
-        "sino_trans":       sino_trans,
-        "sino_abs_lam":     sino_abs_lam,
+        "sino_lam": sino_lam,
+        "sino_trans": sino_trans,
+        "sino_abs_lam": sino_abs_lam,
         "sino_scatter_lam": sino_scatter_lam,
-        "angles_deg":       angles_deg,
-        "I0":               I0,
+        "angles_deg": angles_deg,
+        "I0": I0,
         "scatter_D_over_L": scatter_D_over_L,
-        "voxel_cm":         phantom.voxel_cm,
+        "voxel_cm": phantom.voxel_cm,
     }
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Convenience wrapper

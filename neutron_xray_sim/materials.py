@@ -505,7 +505,7 @@ MATERIALS.update({
 
     "graphite": material_from_formula(
         name="Graphite",
-        symbol="Gr",
+        symbol="Graphite",
         formula="C",
         density_gcc=2.26,
         color="#444444",

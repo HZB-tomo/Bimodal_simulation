@@ -832,13 +832,13 @@ def make_custom_cylindrical_battery_phantom(
     diameter_cm: float = 1.0,
     n_jellyroll_turns: int = 2,
 
-    shell_material: str = "Iron",
+    shell_material: str = "steel",
     cathode_collector_material: str = "aluminum",
     cathode_active_material: str = "nmc811",
     anode_collector_material: str = "copper",
     anode_active_material: str = "graphite",
     separator_material: str = "separator_pe",
-    lithium_material: str = "Li",
+    electrolyte_material: str = "electrolyte_lipf6_1m",
     central_collector_material: str = "copper",
 
     can_thickness_cm: float = 0.03,
@@ -850,7 +850,7 @@ def make_custom_cylindrical_battery_phantom(
     gap_to_first_jellyroll_cm: float = 0.05,
 
     separator_t_cm: float = 0.015,
-    lithium_t_cm: float = 0.005,
+    electrolyte_t_cm: float = 0.005,
     al_t_cm: float = 0.01,
     cathode_t_cm: float = 0.025,
     anode_t_cm: float = 0.025,
@@ -892,7 +892,7 @@ def make_custom_cylindrical_battery_phantom(
         "anode_collector_material": anode_collector_material,
         "anode_active_material": anode_active_material,
         "separator_material": separator_material,
-        "lithium_material": lithium_material,
+        "electrolyte_material": electrolyte_material,
         "central_collector_material": central_collector_material,
     }
 
@@ -988,19 +988,19 @@ def make_custom_cylindrical_battery_phantom(
 
     layer_sequence = [
         (separator_material, separator_t_cm),
-        (lithium_material, lithium_t_cm),
+        (electrolyte_material, electrolyte_t_cm),
 
         (cathode_collector_material, al_t_cm),
         (cathode_active_material, cathode_t_cm),
 
         (separator_material, separator_t_cm),
-        (lithium_material, lithium_t_cm),
+        (electrolyte_material, electrolyte_t_cm),
 
         (anode_active_material, anode_t_cm),
         (anode_collector_material, copper_t_cm),
 
         (separator_material, separator_t_cm),
-        (lithium_material, lithium_t_cm),
+        (electrolyte_material, electrolyte_t_cm),
     ]
 
     for turn_idx in range(n_jellyroll_turns):

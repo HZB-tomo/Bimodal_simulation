@@ -39,6 +39,7 @@ ATOMIC_MASS = {
     "Li": 6.941,
     "C": 12.0107,
     "O": 15.999,
+    "F": 18.998403163,
     "P": 30.973761998,
     "Fe": 55.845,
     "Co": 58.933194,
@@ -53,6 +54,7 @@ NEUTRON_XS = {
     "Li": {"abs": 70.5,   "coh": 0.454,  "inc": 0.92},
     "C":  {"abs": 0.0035, "coh": 5.551,  "inc": 0.001},
     "O":  {"abs": 0.00019,"coh": 4.232,  "inc": 0.0008},
+     "F": {"abs": 0.0096, "coh": 4.018, "inc": 0.0008},
     "P":  {"abs": 0.172,  "coh": 3.307,  "inc": 0.005},
     "Fe": {"abs": 2.56,   "coh": 11.22,  "inc": 0.40},
     "Co": {"abs": 37.18,  "coh": 0.779,  "inc": 4.8},
@@ -130,7 +132,7 @@ def _element_mu_over_rho(element: str) -> np.ndarray:
 
 
 def build_xray_mass_atten():
-    elements = ["H", "Li", "C", "O", "P", "Fe", "Co", "Ni", "Mn"]
+    elements = ["H", "Li", "C", "O", "F", "P", "Fe", "Co", "Ni", "Mn"]
 
     data = {}
     for el in elements:
@@ -466,6 +468,40 @@ MATERIALS: Dict[str, Material] = {
 
 
 MATERIALS.update({
+
+    "lithium": material_from_formula(
+        name="Lithium Metal",
+        symbol="Li",
+        formula="Li",
+        density_gcc=0.534,
+        color="#B0B0B0",
+    ),
+
+    # Approximate 1 M LiPF6 electrolyte in organic carbonate solvent.
+    #
+    # Model assumption:
+    #   1 M LiPF6 in EC/DMC-like organic solvent.
+    #   Represented as an effective pseudo-compound with approximate elemental
+    #   composition:
+    #
+    #       LiPF6 + carbonate solvent background
+    #
+    # This is not chemically exact, but it is good enough for phantom contrast.
+    "electrolyte_lipf6_1m": material_from_formula(
+        name="1 M LiPF6 Organic Electrolyte",
+        symbol="LiPF6-sol",
+        formula="Li1P1F6C5H10O3",
+        density_gcc=1.20,
+        color="#66CCFF",
+        incoherent_scale=0.5,
+    ),
+    "steel": material_from_formula(
+    name="Steel (Fe-Ni)",
+    symbol="Steel",
+    formula="Fe0.98Ni0.02",
+    density_gcc=7.85,
+    color="#777777",
+    ),
 
     "graphite": material_from_formula(
         name="Graphite",

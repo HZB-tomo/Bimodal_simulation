@@ -824,264 +824,216 @@ def make_industrial_phantom(
 
 
 
-
-def make_18650_battery_phantom(
+def make_custom_cylindrical_battery_phantom(
     N: int = 256,
-    voxel_cm: float = None,
+    length_cm: float = 2.0,
+    voxel_cm: Optional[float] = None,
     *,
-    anode_material: str = "graphite",
-    cathode_material: str = "nmc811",
+    diameter_cm: float = 1.0,
+    n_jellyroll_turns: int = 2,
+
+    shell_material: str = "Iron",
+    cathode_collector_material: str = "aluminum",
+    cathode_active_material: str = "nmc811",
+    anode_collector_material: str = "copper",
+    anode_active_material: str = "graphite",
     separator_material: str = "separator_pe",
-    shell_material: str = "aluminum",
-    electrolyte_material: str = "water",
-    collector_material: str = "aluminum",
-    gap_frac: float = 0.05,
-    can_thickness_cm: Optional[float] = None,
-    cap_thickness_cm: Optional[float] = None,
-    collector_radius_cm: Optional[float] = None,
+    lithium_material: str = "Li",
+    central_collector_material: str = "copper",
+
+    can_thickness_cm: float = 0.03,
+    cap_thickness_cm: float = 0.03,
+    jellyroll_gap_top_cm: float = 0.05,
+    jellyroll_gap_bottom_cm: float = 0.05,
+    central_collector_inner_radius_cm: float = 0.04,
+    central_collector_outer_radius_cm: float = 0.07,
+    gap_to_first_jellyroll_cm: float = 0.05,
+
+    separator_t_cm: float = 0.015,
+    lithium_t_cm: float = 0.005,
+    al_t_cm: float = 0.01,
+    cathode_t_cm: float = 0.025,
+    anode_t_cm: float = 0.025,
+    copper_t_cm: float = 0.01,
+
     center_cm: Tuple[float, float, float] = (0.0, 0.0, 0.0),
 ) -> PhantomData:
     """
-    Build a simplified 18650 cylindrical battery phantom.
+    Build a parameterized cylindrical battery phantom.
 
-    Geometry:
-      - outer can side wall
-      - top and bottom caps
-      - shortened concentric jellyroll with axial gap to caps
-      - central collector rod connected to top cap and stopping at jellyroll bottom
+    Coordinate convention:
+        center_cm = (z, x, y)
+        storage shape = (Nz, Nx, Ny)
 
-    Physical dimensions follow a realistic 18650:
-      - diameter = 18 mm  -> radius = 0.9 cm
-      - length   = 65 mm  -> height = 6.5 cm
+    Default geometry:
+        diameter = 1 cm
+        length   = 2 cm
+        axis     = z
 
-    Parameters
-    ----------
-    N : int
-        Cubic phantom size (N x N x N voxels).
-    voxel_cm : float, optional
-        Voxel size in cm. If None, chosen so the 6.5 cm battery length fits in the cube.
-    anode_material : str
-        Material key in MATERIALS for the anode layers.
-    cathode_material : str
-        Material key in MATERIALS for the cathode layers.
-    separator_material : str
-        Material key in MATERIALS for the separator layers.
-    shell_material : str
-        Material key in MATERIALS for the battery can and caps.
-    electrolyte_material : str
-        Material key used as the background fill inside the jellyroll region.
-    collector_material : str
-        Material key for the central current collector rod.
-    gap_frac : float
-        Fraction of full battery height used as top and bottom jellyroll gap.
-        Clipped to [0.02, 0.05].
-    can_thickness_cm : float, optional
-        Radial thickness of the outer can. If None, chosen automatically.
-    cap_thickness_cm : float, optional
-        Axial thickness of the top/bottom caps. If None, defaults to can_thickness_cm.
-    collector_radius_cm : float, optional
-        Radius of the central collector rod. If None, chosen automatically.
-    center_cm : tuple
-        Battery center position (cy, cx, cz).
+    Phantom grid:
+        Nx = N
+        Ny = N
+        Nz chosen from length_cm / voxel_cm
 
-    Returns
-    -------
-    PhantomData
+    Jellyroll:
+        separator + lithium
+        aluminum cathode collector
+        cathode active material
+        separator + lithium
+        anode active material
+        copper anode collector
+        separator + lithium
     """
-    # Validate materials
-    required = {
-        "anode_material": anode_material,
-        "cathode_material": cathode_material,
-        "separator_material": separator_material,
+
+    required_materials = {
         "shell_material": shell_material,
-        "electrolyte_material": electrolyte_material,
-        "collector_material": collector_material,
+        "cathode_collector_material": cathode_collector_material,
+        "cathode_active_material": cathode_active_material,
+        "anode_collector_material": anode_collector_material,
+        "anode_active_material": anode_active_material,
+        "separator_material": separator_material,
+        "lithium_material": lithium_material,
+        "central_collector_material": central_collector_material,
     }
-    missing = [k for k, v in required.items() if v not in MATERIALS]
+
+    missing = [k for k, v in required_materials.items() if v not in MATERIALS]
     if missing:
         raise ValueError(
             "Unknown material(s): "
-            + ", ".join(f"{k}='{required[k]}'" for k in missing)
+            + ", ".join(f"{k}='{required_materials[k]}'" for k in missing)
             + f". Available materials: {list(MATERIALS.keys())}"
         )
 
-    # Realistic 18650 geometry
-    outer_radius_cm = 0.9   # 18 mm diameter
-    outer_height_cm = 6.5   # 65 mm length
-
     if voxel_cm is None:
-        voxel_cm = outer_height_cm / N
+        voxel_cm = diameter_cm / N
 
-    b = PhantomBuilder(N, voxel_cm)
+    Nx = N
+    Ny = N
+    Nz = int(np.ceil(length_cm / voxel_cm))
 
-    cy0, cx0, cz0 = center_cm
+    b = PhantomBuilder(
+        Nx=Nx,
+        Ny=Ny,
+        Nz=Nz,
+        voxel_cm=voxel_cm,
+    )
 
-    # Thickness choices
-    if can_thickness_cm is None:
-        can_thickness_cm = max(2 * voxel_cm, 0.03 * outer_radius_cm)
+    cz0, cx0, cy0 = center_cm
 
-    if cap_thickness_cm is None:
-        cap_thickness_cm = can_thickness_cm
-
-    if collector_radius_cm is None:
-        collector_radius_cm = max(1.5 * voxel_cm, 0.06 * outer_radius_cm)
-
-    # Gap between jellyroll and caps
-    gap_frac = float(np.clip(gap_frac, 0.02, 0.05))
-    axial_gap_cm = gap_frac * outer_height_cm
+    outer_radius_cm = diameter_cm / 2
+    outer_height_cm = length_cm
 
     inner_radius_cm = outer_radius_cm - can_thickness_cm
     if inner_radius_cm <= 0:
-        raise ValueError("can_thickness_cm is too large for the chosen battery radius.")
+        raise ValueError("can_thickness_cm is too large.")
 
-    inner_cavity_height_cm = outer_height_cm - 2 * cap_thickness_cm
-    jellyroll_height_cm = inner_cavity_height_cm - 2 * axial_gap_cm
+    inner_height_cm = outer_height_cm - 2 * cap_thickness_cm
+    jellyroll_height_cm = (
+        inner_height_cm
+        - jellyroll_gap_top_cm
+        - jellyroll_gap_bottom_cm
+    )
+
     if jellyroll_height_cm <= 0:
         raise ValueError(
             "Jellyroll height became non-positive. "
-            "Reduce cap_thickness_cm or gap_frac."
+            "Reduce cap_thickness_cm or jellyroll axial gaps."
         )
 
-    # ------------------------------------------------------------
-    # 1) Outer side wall
-    # ------------------------------------------------------------
+    if central_collector_outer_radius_cm >= inner_radius_cm:
+        raise ValueError("Central collector is too large for the cell.")
+
+    # Outer cylindrical can
     b.add_hollow_cylinder(
         shell_material,
-        center_cm=(cy0, cx0, cz0),
+        center_cm=center_cm,
         inner_radius_cm=inner_radius_cm,
         outer_radius_cm=outer_radius_cm,
         height_cm=outer_height_cm,
-        axis="y",
+        axis="z",
     )
 
-    # ------------------------------------------------------------
-    # 2) Bottom and top caps
-    # ------------------------------------------------------------
-    b.add_disk(
-        shell_material,
-        center_cm=(cy0 - outer_height_cm / 2 + cap_thickness_cm / 2, cx0, cz0),
-        radius_cm=outer_radius_cm,
-        thickness_cm=cap_thickness_cm,
-        axis="y",
-    )
+    # Bottom and top caps
+    bottom_cap_z = cz0 - outer_height_cm / 2 + cap_thickness_cm / 2
+    top_cap_z = cz0 + outer_height_cm / 2 - cap_thickness_cm / 2
 
     b.add_disk(
         shell_material,
-        center_cm=(cy0 + outer_height_cm / 2 - cap_thickness_cm / 2, cx0, cz0),
+        center_cm=(bottom_cap_z, cx0, cy0),
         radius_cm=outer_radius_cm,
         thickness_cm=cap_thickness_cm,
-        axis="y",
+        axis="z",
     )
 
-    # ------------------------------------------------------------
-    # 3) Fill jellyroll volume with electrolyte/background
-    # ------------------------------------------------------------
-    b.add_cylinder(
-        electrolyte_material,
-        center_cm=(cy0, cx0, cz0),
-        radius_cm=inner_radius_cm,
+    b.add_disk(
+        shell_material,
+        center_cm=(top_cap_z, cx0, cy0),
+        radius_cm=outer_radius_cm,
+        thickness_cm=cap_thickness_cm,
+        axis="z",
+    )
+
+    # Central hollow copper current collector
+    b.add_hollow_cylinder(
+        central_collector_material,
+        center_cm=center_cm,
+        inner_radius_cm=central_collector_inner_radius_cm,
+        outer_radius_cm=central_collector_outer_radius_cm,
         height_cm=jellyroll_height_cm,
-        axis="y",
+        axis="z",
     )
 
-    # ------------------------------------------------------------
-    # 4) Concentric jellyroll layers
-    # ------------------------------------------------------------
-    # Layer thicknesses chosen so they remain voxel-resolved
-    cathode_t_cm = max(1.5 * voxel_cm, 0.020 * outer_radius_cm)
-    anode_t_cm = max(1.5 * voxel_cm, 0.020 * outer_radius_cm)
-    separator_t_cm = max(1.0 * voxel_cm, 0.012 * outer_radius_cm)
-    electrolyte_gap_t_cm = max(0.5 * voxel_cm, 0.008 * outer_radius_cm)
-
-    r_outer = inner_radius_cm
+    # Jellyroll layers
+    r_inner = central_collector_outer_radius_cm + gap_to_first_jellyroll_cm
 
     layer_sequence = [
-        (cathode_material, cathode_t_cm),
         (separator_material, separator_t_cm),
-        (anode_material, anode_t_cm),
+        (lithium_material, lithium_t_cm),
+
+        (cathode_collector_material, al_t_cm),
+        (cathode_active_material, cathode_t_cm),
+
         (separator_material, separator_t_cm),
-        (electrolyte_material, electrolyte_gap_t_cm),
+        (lithium_material, lithium_t_cm),
+
+        (anode_active_material, anode_t_cm),
+        (anode_collector_material, copper_t_cm),
+
+        (separator_material, separator_t_cm),
+        (lithium_material, lithium_t_cm),
     ]
 
-    # Leave room for the central collector
-    min_radius_for_layers = collector_radius_cm + max(
-        cathode_t_cm, anode_t_cm, separator_t_cm
-    )
-
-    while r_outer > min_radius_for_layers:
-        placed_any = False
-
+    for turn_idx in range(n_jellyroll_turns):
         for mat, t_cm in layer_sequence:
-            r_inner = r_outer - t_cm
-            if r_inner <= collector_radius_cm:
-                break
+            r_outer = r_inner + t_cm
+
+            if r_outer >= inner_radius_cm:
+                raise ValueError(
+                    f"Jellyroll exceeds inner cell radius during turn {turn_idx + 1}. "
+                    "Reduce n_jellyroll_turns or layer thicknesses."
+                )
 
             b.add_hollow_cylinder(
                 mat,
-                center_cm=(cy0, cx0, cz0),
+                center_cm=center_cm,
                 inner_radius_cm=r_inner,
                 outer_radius_cm=r_outer,
                 height_cm=jellyroll_height_cm,
-                axis="y",
+                axis="z",
             )
-            r_outer = r_inner
-            placed_any = True
 
-        if not placed_any:
-            break
+            r_inner = r_outer
 
-    # ------------------------------------------------------------
-    # 5) Central current collector rod
-    #     - connected to top cap
-    #     - stops at jellyroll bottom
-    # ------------------------------------------------------------
-    y_rod_top = cy0 + outer_height_cm / 2 - cap_thickness_cm
-    y_rod_bottom = cy0 - jellyroll_height_cm / 2
-    rod_height_cm = y_rod_top - y_rod_bottom
-    rod_center_y = 0.5 * (y_rod_top + y_rod_bottom)
+    name = (
+        f"custom_cylindrical_battery_"
+        f"D{diameter_cm:g}cm_L{length_cm:g}cm_"
+        f"{n_jellyroll_turns}_turns"
+    )
 
-    if rod_height_cm > 0:
-        b.add_cylinder(
-            collector_material,
-            center_cm=(rod_center_y, cx0, cz0),
-            radius_cm=collector_radius_cm,
-            height_cm=rod_height_cm,
-            axis="y",
-        )
-
-    name = f"18650_{anode_material}_{cathode_material}_{separator_material}"
     return b.build(name)
 
-def make_18650_nmc811_graphite(
-    N: int = 256,
-    voxel_cm: float = None,
-) -> PhantomData:
-    return make_18650_battery_phantom(
-        N=N,
-        voxel_cm=voxel_cm,
-        anode_material="graphite",
-        cathode_material="nmc811",
-        separator_material="separator_pe",
-        shell_material="aluminum",
-        electrolyte_material="water",
-        collector_material="aluminum",
-    )
 
 
-def make_18650_lfp_graphite(
-    N: int = 256,
-    voxel_cm: float = None,
-) -> PhantomData:
-    return make_18650_battery_phantom(
-        N=N,
-        voxel_cm=voxel_cm,
-        anode_material="graphite",
-        cathode_material="lfp",
-        separator_material="separator_pe",
-        shell_material="aluminum",
-        electrolyte_material="water",
-        collector_material="aluminum",
-    )
 
 # ── Registry ──────────────────────────────────────────────────────────────────
 
@@ -1090,9 +1042,8 @@ PHANTOM_PRESETS: Dict[str, callable] = {
     "battery":       make_battery_phantom,
     "bone_implant":  make_bone_implant_phantom,
     "industrial":    make_industrial_phantom,
-    "battery_18650": make_18650_battery_phantom,
-    "battery_18650_nmc811_graphite": make_18650_nmc811_graphite,
-    "battery_18650_lfp_graphite": make_18650_lfp_graphite,
+    "jellyroll_battery" : make_custom_cylindrical_battery_phantom
+    
 
 
 }

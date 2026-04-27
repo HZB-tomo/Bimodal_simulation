@@ -94,6 +94,106 @@ def _astra_project_2d(vol2d: np.ndarray, angles_rad: np.ndarray) -> np.ndarray:
     return sino
 
 
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Cone-beam projection helper
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _astra_project_cone_2d(
+    vol2d: np.ndarray,
+    angles_rad: np.ndarray,
+    SDD: float,
+    SOD: float,
+) -> np.ndarray:
+    """
+    2-D fan-beam (cone-beam central slice) projection via ASTRA.
+
+    Uses ASTRA's ``fanflat`` geometry, which is the 2-D equivalent of
+    3-D cone-beam and produces a fan-beam sinogram identical to the central
+    slice of a 3-D cone-beam acquisition.
+
+    Parameters
+    ----------
+    vol2d      : (N, N) single axial slice  [any units]
+    angles_rad : (n_angles,) projection angles [rad]
+    SDD        : source-to-detector distance [pixels]
+    SOD        : source-to-object (iso-centre) distance [pixels]
+                 Magnification M = SDD / SOD.  For parallel beam: SOD → ∞.
+
+    Returns
+    -------
+    sino2d : (n_angles, N) fan-beam sinogram  [same units as vol2d]
+
+    Notes
+    -----
+    ASTRA ``fanflat`` geometry convention:
+      - ``source_origin`` = SOD  (source to rotation centre)
+      - ``origin_det``    = SDD − SOD  (rotation centre to detector)
+      - ``det_spacing``   = 1.0 pixel
+    """
+    import astra
+    N   = vol2d.shape[0]
+    det_count = int(round(N * SDD / SOD))   # physical detector width at the detector plane
+
+    vol_geom  = astra.create_vol_geom(N, N)
+    proj_geom = astra.create_proj_geom(
+        "fanflat",
+        1.0,            # detector pixel spacing [pixels]
+        det_count,      # number of detector pixels
+        angles_rad,
+        SOD,            # source–origin distance
+        SDD - SOD,      # origin–detector distance
+    )
+    sino_id, sino = astra.create_sino(vol2d.astype(np.float32), proj_geom,
+                                      vol_geom)
+    astra.data2d.delete(sino_id)
+    return sino   # (n_angles, det_count)
+
+
+def _project_cone_numpy(
+    vol3d: np.ndarray,
+    angle_deg: float,
+    SDD: float,
+    SOD: float,
+) -> np.ndarray:
+    """
+    CPU fallback for fan/cone-beam projection using ray-rescaling.
+
+    Implements a flat-detector magnification correction: each parallel-beam
+    projection line integral at detector position u is remapped to the
+    fan-beam position u' = u · SOD / SDD, which approximates the cone-beam
+    geometry to first order.  This is less accurate than ASTRA's exact
+    fan-beam back-projection but provides a consistent fallback when ASTRA is
+    unavailable.
+
+    Parameters
+    ----------
+    vol3d     : (N, N, N) attenuation volume
+    angle_deg : projection angle [°]
+    SDD       : source-to-detector distance [pixels]
+    SOD       : source-to-object distance [pixels]
+
+    Returns
+    -------
+    proj2d : (N, N) magnified projection  [same units as vol3d]
+    """
+    from scipy.ndimage import zoom
+
+    M       = SDD / SOD          # geometric magnification
+    proj2d  = _ray_sum_numpy(vol3d, angle_deg)   # (N, N) parallel projection
+    # Rescale in the detector direction (axis 1) to simulate magnification
+    proj_mag = zoom(proj2d, (1.0, M), order=1)
+    # Crop or pad to original N along the detector axis
+    N_det = proj2d.shape[1]
+    N_mag = proj_mag.shape[1]
+    if N_mag >= N_det:
+        start = (N_mag - N_det) // 2
+        return proj_mag[:, start:start + N_det]
+    else:
+        pad = N_det - N_mag
+        return np.pad(proj_mag, ((0, 0), (pad // 2, pad - pad // 2)))
+
 # ──────────────────────────────────────────────────────────────────────────────
 # X-ray projector
 # ──────────────────────────────────────────────────────────────────────────────
@@ -205,6 +305,9 @@ def project_xray(
     n_spectrum_bins: int = 12,
     use_astra: bool = True,
     I0: float = 1e5,
+    geometry: str = "parallel",
+    SDD: float = 1000.0,
+    SOD: float = 500.0,
 ) -> dict:
     """
     Compute polychromatic X-ray sinograms (one per slice, stacked 3-D).
@@ -223,6 +326,15 @@ def project_xray(
     n_spectrum_bins  : number of energy bins for polychromatic sum
     use_astra        : use ASTRA GPU projection if available
     I0               : incident photon count (for Poisson noise later)
+    geometry         : ``'parallel'`` (default) or ``'cone'``.
+                       In cone-beam mode the ASTRA ``fanflat`` geometry is used
+                       (GPU path) or a magnification-rescaling approximation
+                       (CPU fallback).
+    SDD              : source-to-detector distance [pixels].  Only used when
+                       ``geometry='cone'``.  Typical lab-CT value: 500–2000.
+    SOD              : source-to-object (iso-centre) distance [pixels].  Only
+                       used when ``geometry='cone'``.
+                       Magnification M = SDD / SOD.
 
     Returns
     -------
@@ -232,6 +344,9 @@ def project_xray(
         'angles_deg' : copy of angles_deg
         'spectrum'   : dict with 'energies_keV' and 'weights'
         'I0'         : incident photon count
+        'geometry'   : ``'parallel'`` or ``'cone'``
+        'SDD'        : source-to-detector distance [pixels]  (cone only)
+        'SOD'        : source-to-object distance [pixels]    (cone only)
     """
     energies_keV, weights = xray_spectrum(kVp, filter_mm_Al, filter_mm_Cu, n_spectrum_bins)
 
@@ -249,17 +364,34 @@ def project_xray(
         # ── ASTRA path: project each energy bin, each slice ───────────────
         import astra
         vol_geom  = astra.create_vol_geom(N, N)
-        proj_geom = astra.create_proj_geom("parallel", 1.0, N, angles_rad)
-        proj_id   = astra.create_projector("cuda", proj_geom, vol_geom)
+        if geometry == "cone":
+            # Fan-beam (cone-beam central-slice) geometry via ASTRA
+            for e_idx, (E, W) in enumerate(zip(energies_keV, weights)):
+                mu_vol = _build_xray_mu_volume(phantom, E)
+                for s_idx in range(N):
+                    fan_sino = _astra_project_cone_2d(
+                        mu_vol[s_idx], angles_rad, SDD, SOD
+                    )  # (n_angles, det_count)
+                    # Trim/pad to N detector columns to keep array shape uniform
+                    det_count = fan_sino.shape[1]
+                    if det_count >= N:
+                        start = (det_count - N) // 2
+                        fan_sino = fan_sino[:, start:start + N]
+                    else:
+                        pad = N - det_count
+                        fan_sino = np.pad(fan_sino,
+                                          ((0, 0), (pad // 2, pad - pad // 2)))
+                    sino_trans[:, s_idx, :] += W * np.exp(-fan_sino * dx)
+        else:
+            # Parallel-beam geometry
+            proj_geom = astra.create_proj_geom("parallel", 1.0, N, angles_rad)
+            proj_id   = astra.create_projector("cuda", proj_geom, vol_geom)
 
-        for e_idx, (E, W) in enumerate(zip(energies_keV, weights)):
-            # Build the attenuation volume at this energy  [cm⁻¹]
+            for e_idx, (E, W) in enumerate(zip(energies_keV, weights)):
+                # Build the attenuation volume at this energy  [cm⁻¹]
+                mu_vol = _build_xray_mu_volume(phantom, E)
 
-            mu_vol = _build_xray_mu_volume(phantom, E)
-            
-            
-
-        astra.projector.delete(proj_id)
+            astra.projector.delete(proj_id)
 
     else:
         # ── NumPy fallback: rotate volume, sum along projection axis ─────
@@ -273,9 +405,14 @@ def project_xray(
                 if mask.any():
                     mu_vol[mask] = mat.mu_x_at(E)
 
-            for a_idx, angle in enumerate(angles_deg):
-                proj2d = _ray_sum_numpy(mu_vol, angle)   # (N, N)  [voxel counts]
-                sino_trans[a_idx] += W * np.exp(-proj2d * dx)
+            if geometry == "cone":
+                for a_idx, angle in enumerate(angles_deg):
+                    proj2d = _project_cone_numpy(mu_vol, angle, SDD, SOD)
+                    sino_trans[a_idx] += W * np.exp(-proj2d * dx)
+            else:
+                for a_idx, angle in enumerate(angles_deg):
+                    proj2d = _ray_sum_numpy(mu_vol, angle)
+                    sino_trans[a_idx] += W * np.exp(-proj2d * dx)
 
     # Safe log-normalisation
     eps = 1.0 / (10 * I0)
@@ -288,6 +425,9 @@ def project_xray(
         "spectrum":   {"energies_keV": energies_keV, "weights": weights},
         "I0":         I0,
         "voxel_cm":   phantom.voxel_cm,
+        "geometry":   geometry,
+        "SDD":        SDD,
+        "SOD":        SOD,
     }
 
 
@@ -413,6 +553,9 @@ def make_sinogram_pair(
     I0_neutron: float = 1e5,
     use_astra: bool = True,
     scatter_D_over_L: float = 100.0,
+    geometry: str = "parallel",
+    SDD: float = 1000.0,
+    SOD: float = 500.0,
 ) -> tuple[dict, dict]:
     """
     Generate X-ray and neutron sinogram pairs for a phantom.
@@ -432,6 +575,13 @@ def make_sinogram_pair(
     I0_neutron       : incident neutron count
     use_astra        : use GPU projection if available
     scatter_D_over_L : neutron beam collimation ratio D/L
+    geometry         : X-ray beam geometry: ``'parallel'`` (default) or
+                       ``'cone'``.  Neutron projection always uses parallel
+                       geometry (standard for neutron imaging beamlines).
+    SDD              : source-to-detector distance [pixels].  Ignored unless
+                       ``geometry='cone'``.
+    SOD              : source-to-object distance [pixels].  Ignored unless
+                       ``geometry='cone'``.  Magnification = SDD / SOD.
 
     Returns
     -------
@@ -454,6 +604,9 @@ def make_sinogram_pair(
             n_spectrum_bins=n_spectrum_bins,
             use_astra=use_astra,
             I0=I0_xray,
+            geometry=geometry,
+            SDD=SDD,
+            SOD=SOD,
         )
 
     elif xray_mode == "monochromatic":

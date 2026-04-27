@@ -500,7 +500,7 @@ def plot_bimodal_histogram(
     title: str = "Bimodal Histogram",
     ax: Optional[plt.Axes] = None,
     log_scale: bool = True,
-    cmap: str = "inferno",
+    cmap: str = "cool",
     show_gmm_ellipses: bool = True,
     show_marginals: bool = True,
     figsize: Tuple[float, float] = (8, 7),
@@ -667,7 +667,7 @@ def plot_comparison_grid(
     ncols: int = 3,
     figsize_per_panel: Tuple[float, float] = (4.5, 4.0),
     log_scale: bool = True,
-    cmap: str = "inferno",
+    cmap: str = "cool",
     suptitle: str = "Artifact Comparison",
 ) -> plt.Figure:
     """
@@ -758,7 +758,7 @@ def plot_ground_truth_comparison(
     title_gt: str = "Ground Truth",
     title_recon: str = "Reconstructed",
     log_scale: bool = True,
-    cmap: str = "inferno",
+    cmap: str = "cool",
     show_marginals: bool = True,
     figsize: Tuple[float, float] = (15, 7),
     suptitle: str = "Ground truth vs Reconstructed bimodal histogram",
@@ -969,15 +969,15 @@ def _draw_recon_panel(
     # Ground-truth position markers
     if gt_mu_x is not None and gt_mu_n is not None:
         for i, (mx, mn) in enumerate(zip(gt_mu_x, gt_mu_n)):
-            col = gt_colours[i] if gt_colours is not None else "white"
+            col = gt_colours[i] if gt_colours is not None else "black"
             sym = materials[i].symbol if materials is not None else str(i)
-            ax_main.plot(mx, mn, marker="D", color="white",
-                         markersize=6, markeredgecolor=col,
+            ax_main.plot(mx, mn, marker="D", color="black",
+                         markersize=6, markeredgecolor="black",
                          markeredgewidth=1.5, zorder=5)
             ax_main.annotate(
                 sym, xy=(mx, mn),
                 xytext=(4, 4), textcoords="offset points",
-                fontsize=7, color="white", fontweight="bold", zorder=6,
+                fontsize=7, color="black", fontweight="bold", zorder=6,
             )
 
     # Top marginal (log-Y)
@@ -1027,7 +1027,7 @@ def plot_cross_algorithm_grid(
     algorithm_pairs,
     bins=128,
     log_scale=True,
-    cmap="inferno",
+    cmap="cool",
     show_marginals=True,
     show_gt_markers=True,
     show_metrics=True,

@@ -429,6 +429,7 @@ def reconstruct(
     center_offset: float = 0.0,
     use_astra: bool = True,
     clip_negative: bool = True,
+    clip_threshold: float = 0.0,
 ) -> np.ndarray:
     """
     Reconstruct a 3-D volume from a sinogram dictionary.
@@ -455,6 +456,11 @@ def reconstruct(
     center_offset: rotation-centre offset in pixels (0 = no correction).
     use_astra    : prefer ASTRA GPU if available.
     clip_negative: clip result to ≥ 0 after reconstruction.
+    clip_threshold: set all voxels below this value to 0 after reconstruction.
+                   Applied after ``clip_negative``.  Useful to suppress air
+                   and other near-zero background voxels.  A typical value
+                   is 0.01–0.05 cm⁻¹ for laboratory CT of solid objects.
+                   Default 0.0 (disabled — equivalent to clip_negative only).
 
     Returns
     -------
@@ -602,6 +608,9 @@ def reconstruct(
     if clip_negative:
         vol = np.clip(vol, 0.0, None)
 
+    if clip_threshold > 0.0:
+        vol[vol < clip_threshold] = 0.0
+
     return vol
 
 
@@ -616,6 +625,7 @@ def reconstruct_pair(
     remove_rings: bool = True,
     use_astra: bool = True,
     clip_negative: bool = True,
+    clip_threshold: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Reconstruct both X-ray and neutron volumes from their sinogram dicts.
@@ -632,6 +642,7 @@ def reconstruct_pair(
     remove_rings : apply Vo ring removal
     use_astra    : prefer ASTRA GPU
     clip_negative: clip to ≥ 0
+    clip_threshold: set voxels below this value to 0 (see :func:`reconstruct`)
 
     Returns
     -------
@@ -641,7 +652,7 @@ def reconstruct_pair(
         algorithm=algorithm, filter_name=filter_name,
         n_iter=n_iter, n_subsets=n_subsets, lambda_tv=lambda_tv,
         remove_rings=remove_rings, use_astra=use_astra,
-        clip_negative=clip_negative,
+        clip_negative=clip_negative, clip_threshold=clip_threshold,
     )
     print(f"[reconstructor] Reconstructing with {algorithm} …")
     print("  -> X-ray …")

@@ -59,6 +59,9 @@ from .phantom import (
     make_battery_phantom,
     make_bone_implant_phantom,
     make_industrial_phantom,
+    make_custom_cylindrical_battery_phantom,
+    make_hdpe_composite_phantom,
+    
     PHANTOM_PRESETS,
 )
 

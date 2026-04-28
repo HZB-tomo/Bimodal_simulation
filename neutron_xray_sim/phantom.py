@@ -822,7 +822,131 @@ def make_industrial_phantom(
 
     return b.build("industrial")
 
+def make_hdpe_composite_phantom(
+    N: Optional[int] = 64,
+    voxel_cm: Optional[float] = None,
+    Nx: Optional[int] = None,
+    Ny: Optional[int] = None,
+    Nz: Optional[int] = None,
+) -> PhantomData:
+    """
+    HDPE block composite phantom.
 
+    Geometry:
+      - HDPE rectangular block as matrix
+      - Steel rod along z direction in one corner
+      - Aluminum cube in the center
+      - Iron cube inside the aluminum cube
+      - Air bubbles dispersed in HDPE
+      - Some bubbles filled with water
+
+    Storage/order convention is (Nz, Nx, Ny).
+    Coordinates are (z, x, y).
+    """
+
+    if any(v is not None for v in (Nx, Ny, Nz)):
+        if not all(v is not None for v in (Nx, Ny, Nz)):
+            raise ValueError("Provide either N only, or all of Nx, Ny, and Nz.")
+        Nx, Ny, Nz = int(Nx), int(Ny), int(Nz)
+        dims = (Nx, Ny, Nz)
+    else:
+        if N is None:
+            raise ValueError("Provide either N or all of Nx, Ny, and Nz.")
+        Nx = Ny = Nz = int(N)
+        dims = (Nx, Ny, Nz)
+
+    if voxel_cm is None:
+        voxel_cm = 1.0 / max(dims)
+
+    b = PhantomBuilder(N=None, Nx=Nx, Ny=Ny, Nz=Nz, voxel_cm=voxel_cm)
+
+    Lx = b.Nx * b.voxel_cm / 2
+    Ly = b.Ny * b.voxel_cm / 2
+    Lz = b.Nz * b.voxel_cm / 2
+    L = min(Lx, Ly, Lz)
+
+    # ------------------------------------------------------------------
+    # 1. HDPE base block
+    # ------------------------------------------------------------------
+    block_hz = 0.78 * Lz
+    block_hx = 0.78 * Lx
+    block_hy = 0.78 * Ly
+
+    b.add_box(
+        "hdpe",
+        center_cm=(0.0, 0.0, 0.0),
+        half_extents_cm=(block_hz, block_hx, block_hy),
+    )
+
+    # ------------------------------------------------------------------
+    # 2. Steel rod along z direction, close to one corner
+    # ------------------------------------------------------------------
+    rod_radius = 0.08 * L
+    rod_x = -0.50 * Lx
+    rod_y = -0.50 * Ly
+
+    b.add_rod(
+        "steel",
+        center_cm=(rod_x, rod_y),
+        radius_cm=rod_radius,
+        axis="z",
+    )
+
+    # ------------------------------------------------------------------
+    # 3. Central aluminum cube
+    # ------------------------------------------------------------------
+    al_half = 0.22 * L
+
+    b.add_box(
+        "aluminum",
+        center_cm=(0.0, 0.0, 0.0),
+        half_extents_cm=(al_half, al_half, al_half),
+    )
+
+    # ------------------------------------------------------------------
+    # 4. Iron cube inside aluminum cube
+    # ------------------------------------------------------------------
+    fe_half = 0.10 * L
+
+    b.add_box(
+        "iron",
+        center_cm=(0.0, 0.0, 0.0),
+        half_extents_cm=(fe_half, fe_half, fe_half),
+    )
+
+    # ------------------------------------------------------------------
+    # 5. Air bubbles, placed away from rod and central cube
+    # ------------------------------------------------------------------
+    air_bubbles = [
+        ((-0.45 * Lz,  0.45 * Lx, -0.35 * Ly), 0.060 * L),
+        (( 0.42 * Lz, -0.35 * Lx,  0.42 * Ly), 0.055 * L),
+        ((-0.25 * Lz,  0.55 * Lx,  0.35 * Ly), 0.050 * L),
+        (( 0.50 * Lz,  0.35 * Lx, -0.45 * Ly), 0.055 * L),
+    ]
+
+    for center, radius in air_bubbles:
+        b.add_sphere(
+            "air",
+            center_cm=center,
+            radius_cm=radius,
+        )
+
+    # ------------------------------------------------------------------
+    # 6. Water-filled bubbles
+    # ------------------------------------------------------------------
+    water_bubbles = [
+        (( 0.35 * Lz, -0.55 * Lx, -0.20 * Ly), 0.060 * L),
+        ((-0.55 * Lz,  0.25 * Lx,  0.45 * Ly), 0.055 * L),
+    ]
+
+    for center, radius in water_bubbles:
+        b.add_sphere(
+            "water",
+            center_cm=center,
+            radius_cm=radius,
+        )
+
+    return b.build("hdpe_composite")
 
 def make_custom_cylindrical_battery_phantom(
     N: int = 256,
@@ -1042,7 +1166,8 @@ PHANTOM_PRESETS: Dict[str, callable] = {
     "battery":       make_battery_phantom,
     "bone_implant":  make_bone_implant_phantom,
     "industrial":    make_industrial_phantom,
-    "jellyroll_battery" : make_custom_cylindrical_battery_phantom
+    "jellyroll_battery" : make_custom_cylindrical_battery_phantom,
+    'HDPE_composite' : make_hdpe_composite_phantom
     
 
 

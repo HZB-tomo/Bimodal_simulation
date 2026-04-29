@@ -14,6 +14,10 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+from math import ceil, pi
+
+
+
 from .materials import Material, MATERIALS, XRAY_E_KEV, xray_spectrum
 
 
@@ -947,6 +951,201 @@ def make_hdpe_composite_phantom(
         )
 
     return b.build("hdpe_composite")
+
+
+
+
+def make_li_ion_battery_phantom(
+    diameter_cm: float = 1.0,
+    length_cm: float = 2.0,
+    N: int = 512,
+    cathode_material: str = "nmc811",
+    can_material: str = "steel",
+    separator_material: str = "separator_pe_electrolyte",
+    name: str = "li_ion_battery_spiral",
+) -> PhantomData:
+    """
+    Cylindrical lithium-ion battery phantom with:
+    - steel can and end disks
+    - central hollow/solid copper collector rod
+    - Archimedean spiral jellyroll
+    - layer sequence:
+      separator / cathode / Al / cathode / separator /
+      graphite / Cu / graphite / separator
+
+    Storage order: (Nz, Nx, Ny)
+    Coordinate order: (z, x, y)
+    """
+
+    # -------------------------
+    # Unit conversions
+    # -------------------------
+    mm = 0.1       # cm
+    um = 1e-4      # cm
+
+    can_thickness = 0.25 * mm          # 0.025 cm
+    cathode_coating = 62.5 * um        # 0.00625 cm
+    anode_coating = 70.0 * um          # 0.007 cm
+    separator = 20.0 * um              # 0.002 cm
+    al_cc = 15.0 * um                  # 0.0015 cm
+    cu_cc = 10.0 * um                  # 0.001 cm
+
+    # End caps
+    bottom_disk_thickness = can_thickness
+    top_disk_thickness = 2.0 * can_thickness
+
+    # Central copper rod
+    rod_outer_diameter_cm = 1.5 * mm   # 1.5 mm total diameter
+    rod_wall_thickness_cm = 0.2 * mm   # as requested
+
+    rod_outer_radius = rod_outer_diameter_cm / 2
+    rod_inner_radius = rod_outer_radius - rod_wall_thickness_cm
+
+    # If wall thickness is larger than radius, make it solid.
+    rod_is_solid = rod_inner_radius <= 0
+    rod_inner_radius = max(0.0, rod_inner_radius)
+
+    rod_height_cm = length_cm - length_cm/8
+    rod_bottom_z = -length_cm / 2 + bottom_disk_thickness + length_cm/20
+    rod_center_z = rod_bottom_z + rod_height_cm / 2 \
+        - length_cm /80 # clearance from the bootom
+
+    # Jellyroll geometry
+    outer_radius = diameter_cm / 2
+    inner_can_radius = outer_radius - can_thickness
+
+    jellyroll_inner_gap = 0.1 * mm
+    jellyroll_inner_radius = rod_outer_radius + jellyroll_inner_gap
+    jellyroll_outer_radius = inner_can_radius - 0.02  # small clearance
+    # Jellyroll starts exactly where rod starts
+    jellyroll_z_min = rod_bottom_z 
+
+    # It fills upward but still respects top clearance
+    jellyroll_z_max = min(
+    rod_bottom_z + rod_height_cm,   # optional: same height as rod
+    length_cm / 2 - top_disk_thickness
+    ) - length_cm/40 # clearance from the bottom
+
+
+    layer_stack = [
+        ("separator", separator_material, separator),
+        ("cathode_1", cathode_material, cathode_coating),
+        ("al_cc", "aluminum", al_cc),
+        ("cathode_2", cathode_material, cathode_coating),
+        ("separator_2", separator_material, separator),
+        ("graphite_1", "graphite", anode_coating),
+        ("cu_cc", "copper", cu_cc),
+        ("graphite_2", "graphite", anode_coating),
+        ("separator_3", separator_material, separator),
+    ]
+
+    pitch_cm = sum(t for _, _, t in layer_stack)
+
+    # -------------------------
+    # Grid
+    # -------------------------
+    voxel_cm = diameter_cm / N
+    Nx = Ny = int(N)
+    Nz = int(ceil(length_cm / voxel_cm))
+
+    b = PhantomBuilder(N=None, Nx=Nx, Ny=Ny, Nz=Nz, voxel_cm=voxel_cm)
+
+    # -------------------------
+    # Can wall and end disks
+    # -------------------------
+    b.add_hollow_cylinder(
+        can_material,
+        inner_radius_cm=inner_can_radius,
+        outer_radius_cm=outer_radius,
+        height_cm=length_cm,
+        axis="z",
+    )
+
+    b.add_disk(
+        can_material,
+        center_cm=(-length_cm / 2 + bottom_disk_thickness / 2, 0, 0),
+        radius_cm=outer_radius,
+        thickness_cm=bottom_disk_thickness,
+        axis="z",
+    )
+
+    b.add_disk(
+        can_material,
+        center_cm=(length_cm / 2 - top_disk_thickness / 2, 0, 0),
+        radius_cm=outer_radius,
+        thickness_cm=top_disk_thickness,
+        axis="z",
+    )
+
+    # -------------------------
+    # Central copper collector rod
+    # -------------------------
+    if rod_is_solid:
+        b.add_cylinder(
+            "copper",
+            center_cm=(rod_center_z, 0, 0),
+            radius_cm=rod_outer_radius,
+            height_cm=rod_height_cm,
+            axis="z",
+        )
+    else:
+        b.add_hollow_cylinder(
+            "copper",
+            center_cm=(rod_center_z, 0, 0),
+            inner_radius_cm=rod_inner_radius,
+            outer_radius_cm=rod_outer_radius,
+            height_cm=rod_height_cm,
+            axis="z",
+        )
+
+    # -------------------------
+    # Spiral jellyroll
+    # -------------------------
+    X = b._X
+    Y = b._Y
+    Z = b._Z
+
+    r = np.sqrt(X**2 + Y**2)
+    theta = np.arctan2(Y, X)
+    theta = np.mod(theta, 2 * np.pi)
+
+    # Archimedean spiral coordinate.
+    # This makes the material bands wind around the center instead of
+    # forming purely concentric rings.
+    spiral_coord = r - jellyroll_inner_radius - pitch_cm * theta / (2 * np.pi)
+
+    jellyroll_mask = (
+        (r >= jellyroll_inner_radius)
+        & (r <= jellyroll_outer_radius)
+        & (Z >= jellyroll_z_min)
+        & (Z <= jellyroll_z_max)
+        & (spiral_coord >= 0)
+    )
+
+    layer_pos = np.mod(spiral_coord, pitch_cm)
+
+    cumulative = 0.0
+    for _, material, thickness in layer_stack:
+        lo = cumulative
+        hi = cumulative + thickness
+
+        layer_mask = jellyroll_mask & (layer_pos >= lo) & (layer_pos < hi)
+        b._label_vol[layer_mask] = b._mat_index(material)
+
+        cumulative = hi
+
+    phantom = b.build(name)
+
+    # Useful metadata as dynamic attributes
+    phantom.pitch_cm = pitch_cm
+    phantom.pitch_um = pitch_cm / um
+    phantom.voxel_um = voxel_cm / um
+    phantom.jellyroll_inner_radius_cm = jellyroll_inner_radius
+    phantom.jellyroll_outer_radius_cm = jellyroll_outer_radius
+    phantom.rod_is_solid = rod_is_solid
+
+    return phantom
+
 
 def make_custom_cylindrical_battery_phantom(
     N: int = 256,

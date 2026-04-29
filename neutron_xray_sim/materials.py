@@ -569,6 +569,17 @@ MATERIALS.update({
         color="#FFDDAA",
         incoherent_scale=0.35,
     ),
+
+    "separator_pe_electrolyte" : material_from_formula(
+    name="PE Separator + LiPF6 Electrolyte",
+    symbol="separator + electrolyte",
+    # Effective pseudo-composition, not chemically exact
+    formula="C7H14O3Li1P1F6",
+    density_gcc=1.05,
+    color="#BFEFFF",
+    incoherent_scale=0.5,
+)
+
 })
 
 

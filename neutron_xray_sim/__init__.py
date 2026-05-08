@@ -116,7 +116,16 @@ from .simulation import (
     run_artifact_survey,
 )
 
-__version__  = "1.0.0"
+from .metrics_table import (
+    HistogramMetricsTable,
+    compute_histogram_metrics,
+)
+
+from .metrics_table_morphology import (
+    compute_histogram_metrics_morphology_aware,
+)
+
+__version__  = "1.1.0"
 __author__   = "neutron_xray_sim contributors"
 
 __all__ = [

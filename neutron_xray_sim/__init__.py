@@ -49,6 +49,8 @@ from .materials import (
     xray_spectrum,
     AIR, WATER, ALUMINUM, HDPE, IRON, TITANIUM,
     COPPER, LEAD, BONE, TUNGSTEN, ZINC,
+    make_composite_material,
+    material_from_formula,
 )
 
 from .phantom import (
@@ -123,6 +125,46 @@ from .metrics_table import (
 
 from .metrics_table_morphology import (
     compute_histogram_metrics_morphology_aware,
+)
+
+from .neutron_spectra import (
+    NEUTRON_MODES,
+    mu_n_lut_for_beam,
+    mu_n_spectrum_lut,
+    plot_spectra,
+    cold_mono_beam,
+    cold_poly_beam,
+    ill_next_beam,
+    
+)
+
+from .diana_plots import (
+	plot_phantom_label_map,
+	plot_bimodal_histogram,
+	plot_xray_marginal,
+	plot_neutron_marginal,
+	plot_reconstruction_slice,
+	plot_CE_vs_nprojections,
+	plot_DB_vs_nprojections,
+	plot_sigma_x_vs_nprojections,
+	plot_sigma_n_vs_nprojections,
+	plot_CE_all_geometries,
+	plot_DB_all_geometries,
+	plot_cross_sweep_heatmap,
+	plot_xray_attenuation_spectra,
+	plot_epsilon_vs_nprojections,
+	plot_pairwise_overlap_vs_nprojections,
+	plot_artifact_fingerprint,
+	plot_metric_by_artifact,
+	plot_algorithm_cross_heatmap,
+	plot_rare_phase_failure,
+	plot_metric_vs_param_multi,
+	plot_nstar_vs_margin,
+	plot_recovery_heatmap,
+	plot_grouped_bars_with_ci,
+	_make_dummy_hist,
+	_demo,
+	
 )
 
 __version__  = "1.1.0"

@@ -212,8 +212,6 @@ or pasted into the GitHub wiki:
 
 ## Citing and license
 
-Author: *neutron_xray_sim contributors* (HZB tomography group).
-
-<!-- TODO (maintainers): add the license and the preferred citation / DOI here. -->
-*No license file was detected in the sources provided; please add one before
-public release, and replace this section with the project's citation information.*
+Author: Built and maintained by Dr. Oriol Sans-Planell and Dr. Shahabeddin Dayani. Helmholtz-Zentrum Berlin.
+Under MIT licence. 
+If you use this work or want to cite us, please use the following DOI: https://doi.org/10.21203/rs.3.rs-9724333/v1 

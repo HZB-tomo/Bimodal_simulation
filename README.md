@@ -172,7 +172,7 @@ Bimodal_simulation/
 │   ├── io.py                  # on-disk SimCache for pipeline stages
 │   ├── diana_plots.py         # publication-figure plotting helpers
 │   └── lib/xray_data/         # NIST XCOM μ/ρ tables (one file per element)
-├── examples/
+├── notebooks/
 │   ├── 01_artifact_comparison.py
 │   ├── 02_misalignment_sweep.py
 │   ├── 03_gmm_segmentation.py

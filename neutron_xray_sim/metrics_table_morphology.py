@@ -41,18 +41,19 @@ Author: neutron_xray_sim contributors.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Dict, Tuple, List
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-from scipy.ndimage import label as nd_label, binary_erosion
+from scipy.ndimage import binary_erosion
+from scipy.ndimage import label as nd_label
 
-from neutron_xray_sim.metrics_table import (
-    HistogramMetricsTable,
-    _normalised_streak_scores,
-)
 from neutron_xray_sim.histogram import (
     HistogramResult,
     detect_artifact_signatures,
+)
+from neutron_xray_sim.metrics_table import (
+    HistogramMetricsTable,
+    _normalised_streak_scores,
 )
 
 
@@ -223,7 +224,8 @@ def compute_histogram_metrics_morphology_aware(
         for i in range(len(names)):
             vals = []
             for j in range(len(names)):
-                if i == j: continue
+                if i == j:
+                    continue
                 d_ij = float(np.linalg.norm(c_arr[i] - c_arr[j]))
                 if d_ij > 1e-9:
                     vals.append((s_arr[i] + s_arr[j]) / d_ij)
@@ -251,7 +253,8 @@ def compute_histogram_metrics_morphology_aware(
                 continue
             ca = np.array(centroids[na])
             cb = np.array(centroids[nb])
-            pts_x = vx_flat[mask]; pts_n = vn_flat[mask]
+            pts_x = vx_flat[mask]
+            pts_n = vn_flat[mask]
             d_a = (pts_x - ca[0])**2 + (pts_n - ca[1])**2
             d_b = (pts_x - cb[0])**2 + (pts_n - cb[1])**2
             pred  = np.where(d_a < d_b, la, lb)

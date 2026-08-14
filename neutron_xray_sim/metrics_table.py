@@ -48,17 +48,16 @@ Author: neutron_xray_sim contributors.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Tuple, List, Any
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
 from neutron_xray_sim.histogram import (
-    HistogramResult,
     GMMFitResult,
-    fit_gmm,
+    HistogramResult,
     detect_artifact_signatures,
+    fit_gmm,
 )
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  Pathology-detection thresholds (overridable through kwargs)
@@ -704,7 +703,8 @@ def compute_histogram_metrics(
             for i in range(len(matched_components)):
                 vals = []
                 for j in range(len(matched_components)):
-                    if i == j: continue
+                    if i == j:
+                        continue
                     d_ij = np.linalg.norm(centres[i] - centres[j])
                     if d_ij > 1e-9:
                         vals.append((s[i] + s[j]) / d_ij)

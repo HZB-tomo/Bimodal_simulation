@@ -23,15 +23,14 @@ This module provides:
 
 from __future__ import annotations
 
-import numpy as np
+import warnings
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
 import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
+import numpy as np
 from matplotlib.patches import Ellipse
 from matplotlib.path import Path
-from matplotlib import cm
-from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Dict
-import warnings
 
 __all__ = [
     "compute_bimodal_histogram",
@@ -214,7 +213,7 @@ def fit_gmm(
     except ImportError:
         raise ImportError(
             "scikit-learn is required for GMM fitting: pip install scikit-learn"
-        )
+        ) from None
 
     vx = hist.vol_x_flat
     vn = hist.vol_n_flat
@@ -287,7 +286,7 @@ def auto_fit_gmm(
                 best_bic = result.bic
                 best_fit = result
         except Exception as e:
-            warnings.warn(f"GMM fitting failed for k={k}: {e}")
+            warnings.warn(f"GMM fitting failed for k={k}: {e}", stacklevel=2)
 
     return best_fit
 
@@ -315,7 +314,6 @@ def segment_by_gmm(
     -------
     label_vol : (N, N, N) int32,  values 0 .. n_components−1
     """
-    N   = vol_x.shape[0]
     vx  = vol_x.ravel()
     vn  = vol_n.ravel()
 
@@ -328,7 +326,7 @@ def segment_by_gmm(
     try:
         from sklearn.mixture import GaussianMixture
     except ImportError:
-        raise ImportError("scikit-learn required: pip install scikit-learn")
+        raise ImportError("scikit-learn required: pip install scikit-learn") from None
 
     # Re-predict using stored GMM parameters
     gm = GaussianMixture(n_components=gmm_result.n_components)
@@ -722,7 +720,7 @@ def compute_ground_truth_histogram(
     phantom,
     bins: int = 256,
     energy_idx: int = 6,
-) -> "HistogramResult":
+) -> HistogramResult:
     """
     Build the ideal bimodal histogram directly from phantom attenuation volumes.
 
@@ -743,8 +741,10 @@ def compute_ground_truth_histogram(
     HistogramResult  with vol_x_flat = phantom mu_x at energy_idx,
                          vol_n_flat = phantom mu_n (imaging-effective total)
     """
-    mu_x = phantom.mu_x_vols[energy_idx]   # (N, N, N)  [cm⁻¹]
-    mu_n = phantom.mu_n_vol                 # (N, N, N)  [cm⁻¹]
+    # One energy at a time: materialising the full 13-energy stack here would
+    # cost 13× the volume for a single slice of it.
+    mu_x = phantom.mu_x_at_index(energy_idx)   # (Nz, Nx, Ny)  [cm⁻¹]
+    mu_n = phantom.mu_n_vol                    # (Nz, Nx, Ny)  [cm⁻¹]
     return compute_bimodal_histogram(mu_x, mu_n, bins=bins)
 
 
@@ -754,7 +754,7 @@ def compute_ground_truth_histogram(
 
 def plot_ground_truth_comparison(
     phantom,
-    hist_recon: "HistogramResult",
+    hist_recon: HistogramResult,
     title_gt: str = "Ground Truth",
     title_recon: str = "Reconstructed",
     log_scale: bool = True,
@@ -800,7 +800,6 @@ def plot_ground_truth_comparison(
     -------
     matplotlib Figure
     """
-    import matplotlib.colors as _mcolors
 
     # ── Material positions and counts from phantom ────────────────────────────
     materials  = phantom.materials
@@ -841,10 +840,8 @@ def plot_ground_truth_comparison(
     ax_gt.set_facecolor("#0d0d0d")
     ax_gt.grid(True, color="#333333", linewidth=0.5, zorder=0)
 
-    for i, (m, mx, mn, sz, col) in enumerate(
-            zip(materials, mu_x_vals, mu_n_vals, sizes, mat_colours)):
-        # Skip pure air (0,0) from the scatter body but still annotate
-        is_air = (mx < 1e-3 and mn < 1e-3)
+    for m, mx, mn, sz, col in zip(
+            materials, mu_x_vals, mu_n_vals, sizes, mat_colours):
 
         # Cross-hairs so values can be read off the axes
         ax_gt.axvline(mx, color=col, linewidth=0.5, alpha=0.35, zorder=1)
@@ -912,7 +909,7 @@ def plot_ground_truth_comparison(
 
 def _draw_recon_panel(
     subfig: plt.Figure,
-    hist: "HistogramResult",
+    hist: HistogramResult,
     title: str,
     log_scale: bool,
     cmap: str,
@@ -969,7 +966,6 @@ def _draw_recon_panel(
     # Ground-truth position markers
     if gt_mu_x is not None and gt_mu_n is not None:
         for i, (mx, mn) in enumerate(zip(gt_mu_x, gt_mu_n)):
-            col = gt_colours[i] if gt_colours is not None else "black"
             sym = materials[i].symbol if materials is not None else str(i)
             ax_main.plot(mx, mn, marker="D", color="black",
                          markersize=6, markeredgecolor="black",
@@ -1217,7 +1213,7 @@ def plot_cross_algorithm_grid(
                         exclude_air=True,
                     )
                 except Exception as exc:
-                    _warn.warn(f"Metrics failed for {pair}: {exc}")
+                    _warn.warn(f"Metrics failed for {pair}: {exc}", stacklevel=2)
                     panel_metrics[pair] = None
             else:
                 panel_metrics[pair] = None
@@ -1260,7 +1256,6 @@ def plot_cross_algorithm_grid(
         # Build title lines
         title = f"X-ray: {alg_x}  |  Neutron: {alg_n}"
         if m is not None:
-            nan = float("nan")
             db  = m.davies_bouldin
             ce  = m.mean_centroid_error
             db_s = f"{db:.3f}" if db == db else "n/a"
@@ -1343,8 +1338,8 @@ def make_cross_algorithm_sinos(
         pairs = [("FBP", "SIRT"), ("SIRT", "FBP"), ("SART", "SART")]
         fig, hists = plot_cross_algorithm_grid(phantom, x_sinos, n_sinos, pairs)
     """
-    from .projector import make_sinogram_pair
     from .artifacts import inject_sinogram_artifacts
+    from .projector import make_sinogram_pair
 
     xray_sino, neutron_sino = make_sinogram_pair(
         phantom,
@@ -1428,7 +1423,7 @@ class ClusterQualityMetrics:
     davies_bouldin:      float
     overlap_fractions:   Dict[Tuple[str, str], float]
     n_matched:           int
-    gmm:                 "GMMFitResult"
+    gmm:                 GMMFitResult
 
     def summary(self, indent: str = "  ") -> str:
         """Return a compact human-readable summary string."""
@@ -1454,14 +1449,14 @@ class ClusterQualityMetrics:
 
 
 def evaluate_histogram_quality(
-    hist: "HistogramResult",
+    hist: HistogramResult,
     phantom,
     n_components: Optional[int] = None,
     energy_idx: int = 6,
     exclude_air: bool = True,
     gmm_n_init: int = 5,
     gmm_max_iter: int = 300,
-) -> "ClusterQualityMetrics":
+) -> ClusterQualityMetrics:
     """
     Quantitatively evaluate bimodal histogram cluster quality against the
     known ground-truth material positions from *phantom*.
@@ -1504,7 +1499,7 @@ def evaluate_histogram_quality(
     except ImportError:
         raise ImportError(
             "scikit-learn is required: pip install scikit-learn"
-        )
+        ) from None
 
     # ── Ground-truth positions ────────────────────────────────────────────────
     materials    = phantom.materials
@@ -1628,9 +1623,9 @@ def evaluate_histogram_quality(
                 if k in mat_name_to_idx
             }
 
-            for name_a, gmm_idx_a in matched_gt.items():
+            for name_a in matched_gt:
                 mat_idx_a = mat_name_to_idx.get(name_a, -1)
-                for name_b, gmm_idx_b in matched_gt.items():
+                for name_b in matched_gt:
                     if name_b <= name_a:
                         continue
                     mat_idx_b = mat_name_to_idx.get(name_b, -1)
@@ -1649,7 +1644,7 @@ def evaluate_histogram_quality(
                     )
                     overlap_fractions[(name_a, name_b)] = wrong / len(true)
         except Exception as exc:
-            warnings.warn(f"Overlap fraction computation failed: {exc}")
+            warnings.warn(f"Overlap fraction computation failed: {exc}", stacklevel=2)
 
     # ── Package GMMFitResult ──────────────────────────────────────────────────
     labels_full = np.full(len(vx), -1, dtype=np.int32)
@@ -1689,7 +1684,7 @@ def compare_algorithms(
     energy_idx: int = 6,
     exclude_air: bool = True,
     print_table: bool = True,
-) -> Dict[str, "ClusterQualityMetrics"]:
+) -> Dict[str, ClusterQualityMetrics]:
     """
     Evaluate cluster quality for a list of SimulationResult objects and
     optionally print a formatted ASCII comparison table.
@@ -1713,7 +1708,7 @@ def compare_algorithms(
         metrics = compare_algorithms([r_fbp, r_sirt, r_sart], phantom=phantom)
     """
     n_mat = len(phantom.materials)
-    metrics_dict: Dict[str, "ClusterQualityMetrics"] = {}
+    metrics_dict: Dict[str, ClusterQualityMetrics] = {}
 
     for r in results:
         tag  = getattr(r, "tag", str(r))
@@ -1733,7 +1728,7 @@ def compare_algorithms(
 
 
 def _print_quality_table(
-    metrics_dict: Dict[str, "ClusterQualityMetrics"],
+    metrics_dict: Dict[str, ClusterQualityMetrics],
 ) -> None:
     """Print a formatted ASCII comparison table of cluster quality metrics."""
     if not metrics_dict:

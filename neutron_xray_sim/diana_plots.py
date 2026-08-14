@@ -21,15 +21,14 @@ synthetic dummy data to verify all functions execute without error:
 All functions write their output to OUTPUT_DIR (default: outputs_disc_sweep/).
 """
 
-import numpy as np
-import matplotlib
-import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
-import matplotlib.ticker as ticker
-from matplotlib import font_manager
-from matplotlib.patches import Ellipse, Patch, Rectangle
-from mpl_toolkits.axes_grid1 import make_axes_locatable
 import pathlib
+
+import matplotlib.colors as mcolors
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib import font_manager
+from matplotlib.patches import Rectangle
+from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 # ── Global style ─────────────────────────────────────────────────────────────
 plt.style.use('classic')
@@ -918,7 +917,7 @@ def plot_pairwise_overlap_vs_nprojections(n_proj_vals, overlap_data,
     colors = ['#2471A3', '#C0392B', '#1E8449', '#8E44AD', '#D35400', '#7F8C8D']
     pair_labels = [f'{sa}\u2013{sb}' for sa, sb in overlap_data.keys()]
 
-    for ((sa, sb), vals), ls, col in zip(overlap_data.items(), linestyles, colors):
+    for vals, ls, col in zip(overlap_data.values(), linestyles, colors):
         ax.plot(n_proj_vals, vals, ls, color=col, lw=2.0, ms=7,
                 marker='o', markeredgecolor='black', markeredgewidth=0.7)
 
@@ -1345,9 +1344,12 @@ def plot_nstar_vs_margin(margins, nstar, fit_coeffs=None, tol=None,
         xx = np.linspace(m.min(), m.max(), 100)
         ax.plot(xx, a * xx ** b, '-', color='#C0392B', lw=2.0, zorder=2)
         handles_lbls.append(rf'fit: $N^* = {a:.0f}\,\Delta^{{{b:.2f}}}$')
-        handles_cols.append('#C0392B'); handles_mk.append('None'); handles_ls.append('-')
+        handles_cols.append('#C0392B')
+        handles_mk.append('None')
+        handles_ls.append('-')
 
-    ax.set_xscale('log'); ax.set_yscale('log')
+    ax.set_xscale('log')
+    ax.set_yscale('log')
     ax.set_xlabel(r'Separability margin $\Delta_{ab}/\bar{\sigma}$',
                   fontname='serif', fontsize=12)
     ax.set_ylabel(r'Required projections $N^*(\tau)$', fontname='serif', fontsize=12)
@@ -1421,7 +1423,8 @@ def plot_recovery_heatmap(matrix, row_labels, col_labels,
             ax.text(ic, ir, txt, ha='center', va='center',
                     fontsize=8, color=txt_col, fontfamily='serif')
 
-    ax.set_xticks(range(nc)); ax.set_yticks(range(nr))
+    ax.set_xticks(range(nc))
+    ax.set_yticks(range(nr))
     ax.set_xticklabels(col_labels, fontname='serif', fontsize=9, rotation=0)
     ax.set_yticklabels(row_labels, fontname='serif', fontsize=10)
     ax.set_title(title, fontname='serif', fontsize=12)
@@ -1484,7 +1487,8 @@ def plot_grouped_bars_with_ci(labels, means, ci_low, ci_high,
                                   linestyle='--', label=baseline_label)],
                   fontsize=10, prop=FONT, framealpha=0.7)
 
-    ax.set_xticks(x); ax.set_xticklabels(labels, fontname='serif', fontsize=10)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontname='serif', fontsize=10)
     ax.set_ylabel(ylabel, fontname='serif', fontsize=12)
     ax.set_title(title, fontname='serif', fontsize=12)
     ax.tick_params(labelsize=10)
@@ -1539,8 +1543,10 @@ def _demo():
 
     class _Mat:
         def __init__(self, sym, dens, col):
-            self.symbol = sym; self.name = sym
-            self.density_gcc = dens; self.color = col
+            self.symbol = sym
+            self.name = sym
+            self.density_gcc = dens
+            self.color = col
         def mu_x_at(self, e): return self.density_gcc * 0.1 * (80.0 / e) ** 0.3
 
     materials = [
@@ -1591,7 +1597,6 @@ def _demo():
                                           condition='clean')
 
     # --- cross-sweep heatmap ---
-    N = len(n_vals)
     cross_ce = np.array([[1.0 / ((nx * nn) ** 0.2)
                           for nn in n_vals] for nx in n_vals])
     cross_db = np.array([[2.0 / ((nx * nn) ** 0.18)
@@ -1625,7 +1630,6 @@ def _demo():
                                        'G3: Stratigraphy'])
 
     # --- X-ray attenuation spectra ---
-    import numpy as _np
     XRAY_E_KEV = [20., 30., 40., 50., 60., 70., 80., 90., 100., 120., 150., 200., 300.]
     plot_xray_attenuation_spectra(materials[1:], XRAY_E_KEV)
 

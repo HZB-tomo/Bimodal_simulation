@@ -37,30 +37,30 @@ Usage
 from __future__ import annotations
 
 import time
-import numpy as np
-import matplotlib.pyplot as plt
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-from .phantom      import PhantomData, make_phantom
-from .projector    import make_sinogram_pair
-from .artifacts    import ArtifactConfig, inject_sinogram_artifacts, inject_volume_artifacts
-from .reconstructor import reconstruct_pair, AVAILABLE_ALGORITHMS
-from .io           import SimCache, tag_to_slug
-from .histogram    import (
-    HistogramResult,
+import matplotlib.pyplot as plt
+import numpy as np
+
+from .artifacts import ArtifactConfig, inject_sinogram_artifacts, inject_volume_artifacts
+from .histogram import (
+    ArtifactSignatures,
+    ClusterQualityMetrics,
     GMMFitResult,
-    compute_bimodal_histogram,
-    compute_ground_truth_histogram,
-    fit_gmm,
+    HistogramResult,
     auto_fit_gmm,
+    compute_bimodal_histogram,
+    detect_artifact_signatures,
+    evaluate_histogram_quality,
+    fit_gmm,
     plot_bimodal_histogram,
     plot_comparison_grid,
-    detect_artifact_signatures,
-    ArtifactSignatures,
-    evaluate_histogram_quality,
-    ClusterQualityMetrics,
 )
+from .io import SimCache
+from .phantom import PhantomData, make_phantom
+from .projector import make_sinogram_pair
+from .reconstructor import reconstruct_pair
 
 __all__ = ["SimulationResult", "DualModalitySimulation",
            "run_artifact_survey", "ClusterQualityMetrics"]
@@ -117,7 +117,7 @@ class SimulationResult:
         if self.signatures is not None:
             s = self.signatures
             lines += [
-                f"  Signatures:",
+                "  Signatures:",
                 f"    horiz_streak  = {s.horizontal_streak_score:.3f}",
                 f"    vert_streak   = {s.vertical_streak_score:.3f}",
                 f"    diag_smear    = {s.diagonal_smear_score:.3f}",
@@ -146,17 +146,20 @@ class SimulationResult:
         titles_x = ["X-ray XY", "X-ray XZ", "X-ray YZ"]
         titles_n = ["Neutron XY", "Neutron XZ", "Neutron YZ"]
 
-        for col, (ax_x, ax_n, ttx, ttn, slc) in enumerate(zip(
+        # Window limits are shared across the three orthogonal views, so
+        # they are computed once rather than per panel.
+        vmin_x, vmax_x = np.percentile(self.vol_xray, [1, 99])
+        vmin_n, vmax_n = np.percentile(self.vol_neutron, [1, 99])
+
+        for ax_x, ax_n, ttx, ttn, slc in zip(
             axes[0], axes[1], titles_x, titles_n,
             [
                 (self.vol_xray[si], self.vol_neutron[si]),
                 (self.vol_xray[:, si, :], self.vol_neutron[:, si, :]),
                 (self.vol_xray[:, :, si], self.vol_neutron[:, :, si]),
             ]
-        )):
+        ):
             vx_sl, vn_sl = slc
-            vmin_x, vmax_x = np.percentile(self.vol_xray, [1, 99])
-            vmin_n, vmax_n = np.percentile(self.vol_neutron, [1, 99])
 
             ax_x.imshow(vx_sl, cmap="gray", vmin=vmin_x, vmax=vmax_x)
             ax_x.set_title(ttx, fontsize=10)
@@ -209,6 +212,10 @@ class DualModalitySimulation:
                       this directory so that analysis can be re-run without
                       repeating the simulation.  Pass a string or Path.
     overwrite_cache : if True, overwrite existing cache files.
+    remove_rings    : apply Vo (2018) ring removal before reconstruction.
+                      Automatically suppressed for runs that enable
+                      ``ring_artifacts``, since the correction targets exactly
+                      the offsets that artifact injects.
     """
 
     def __init__(
@@ -232,6 +239,7 @@ class DualModalitySimulation:
         phantom: Optional[PhantomData] = None,
         cache_dir: Optional[str] = None,
         overwrite_cache: bool = False,
+        remove_rings: bool = True,
     ):
         self.preset          = preset
         self.N               = N
@@ -249,6 +257,7 @@ class DualModalitySimulation:
         self.max_gmm_k       = max_gmm_k
         self.use_astra       = use_astra
         self.verbose         = verbose
+        self.remove_rings    = remove_rings
 
         # ── Cache ────────────────────────────────────────────────────────────
         self.cache: Optional[SimCache] = (
@@ -259,6 +268,10 @@ class DualModalitySimulation:
         # Load or use supplied phantom
         if phantom is not None:
             self.phantom = phantom
+            # Keep self.N consistent with the phantom actually in use. It was
+            # previously left at the constructor default, so slice indices
+            # derived from it could fall outside a supplied phantom.
+            self.N = phantom.Nz
         else:
             if verbose:
                 print(f"[sim] Loading phantom '{preset}' at N={N} …")
@@ -290,7 +303,13 @@ class DualModalitySimulation:
     # ──────────────────────────────────────────────────────────────────────────
 
     def _ensure_sinograms(self, I0_xray: float = 1e5, I0_neutron: float = 1e5):
-        """Project phantom if not already done (results cached in memory and on disk)."""
+        """Project the phantom once; reuse the clean sinograms for every run.
+
+        The raw sinograms are noise-free, so they are genuinely reusable across
+        artifact configurations.  ``I0`` only sets the log-clipping floor here;
+        the noise model in ``artifacts`` applies each run's own ``I0``, and
+        ``inject_sinogram_artifacts`` stamps it back onto the output dict.
+        """
         if self._raw_xray_sino is None:
             if self.verbose:
                 print("[sim] Computing raw sinograms (cached for subsequent runs) …")
@@ -320,29 +339,42 @@ class DualModalitySimulation:
 
     def run(
         self,
-        cfg: ArtifactConfig = ArtifactConfig.clean(),
+        cfg: Optional[ArtifactConfig] = None,
         tag: Optional[str] = None,
         rng_seed: int = 0,
         ref_result: Optional[SimulationResult] = None,
         n_gmm_components: Optional[int] = None,
+        remove_rings: Optional[bool] = None,
     ) -> SimulationResult:
         """
         Execute one full simulation run with the given artifact configuration.
 
         Parameters
         ----------
-        cfg              : ArtifactConfig describing which artifacts to inject
-        tag              : label for this run (default: cfg.summary())
+        cfg              : ArtifactConfig describing which artifacts to inject.
+                           Defaults to a fresh ``ArtifactConfig.clean()``.
+        tag              : label for this run (default: ``cfg.summary()``)
         rng_seed         : random seed for reproducibility
         ref_result       : reference SimulationResult for shift comparison in
                            artifact-signature analysis
         n_gmm_components : if set, fit a GMM with exactly this many components;
                            if None and auto_gmm=True, uses BIC selection
+        remove_rings     : apply Vo ring removal before reconstruction. When
+                           None (the default) it follows the simulation's
+                           ``remove_rings`` setting, which is itself disabled
+                           automatically for runs that inject ring artifacts —
+                           otherwise the correction would erase the very
+                           artifact under study.
 
         Returns
         -------
         SimulationResult
         """
+        # A mutable default argument is evaluated once at import time and then
+        # shared by every call, so it is constructed per call instead.
+        if cfg is None:
+            cfg = ArtifactConfig.clean()
+
         if tag is None:
             tag = cfg.summary()[:60]
 
@@ -370,15 +402,21 @@ class DualModalitySimulation:
         )
 
         # ── 3. Reconstruct ────────────────────────────────────────────────────
+        # Ring removal subtracts exactly the kind of constant column offset that
+        # `ring_artifacts` injects, so applying both would quietly cancel the
+        # artifact being studied. Default to off whenever rings are enabled.
+        if remove_rings is None:
+            remove_rings = self.remove_rings and not cfg.ring_artifacts
+
         if self.verbose:
-            print("[sim] Reconstructing …")
+            print(f"[sim] Reconstructing (ring removal: {'on' if remove_rings else 'off'}) …")
         vol_x, vol_n = reconstruct_pair(
             xray_sino, neutron_sino,
             algorithm    = self.algorithm,
             filter_name  = self.filter_name,
             n_iter       = self.n_iter,
             use_astra    = self.use_astra,
-            remove_rings = True,
+            remove_rings = remove_rings,
         )
 
         # ── 4. Volume-domain artifacts ────────────────────────────────────────
@@ -575,8 +613,8 @@ def run_artifact_survey(
     compute_metrics: bool = True,
     figsize_per_panel: Tuple[float, float] = (5.5, 5.0),
     cmap: str = "inferno",
-    phantom: Optional["PhantomData"] = None,
-) -> Tuple[Dict[str, "SimulationResult"], plt.Figure, Dict[str, "ClusterQualityMetrics"]]:
+    phantom: Optional[PhantomData] = None,
+) -> Tuple[Dict[str, SimulationResult], plt.Figure, Dict[str, ClusterQualityMetrics]]:
     """
     Run the full simulation pipeline (projection → reconstruction → 2-D histogram)
     once per artifact type, and once per selected combination, with a clean
@@ -630,7 +668,7 @@ def run_artifact_survey(
     """
 
     # ── Define all single-artifact configurations ─────────────────────────────
-    single_configs: List[Tuple[str, "ArtifactConfig"]] = [
+    single_configs: List[Tuple[str, ArtifactConfig]] = [
         (
             "Clean (reference)",
             ArtifactConfig.clean(),
@@ -680,7 +718,7 @@ def run_artifact_survey(
     ]
 
     # ── Combination configurations ─────────────────────────────────────────────
-    combo_configs: List[Tuple[str, "ArtifactConfig"]] = [
+    combo_configs: List[Tuple[str, ArtifactConfig]] = [
         (
             "Noise + misalign",
             ArtifactConfig(
@@ -735,7 +773,7 @@ def run_artifact_survey(
         print(f"  Artifact survey: {n_runs} runs on '{preset}' phantom (N={N})")
         print("═"*60)
 
-    results: Dict[str, "SimulationResult"] = {}
+    results: Dict[str, SimulationResult] = {}
     ref_result = None
 
     for tag, cfg in all_configs:
@@ -745,7 +783,7 @@ def run_artifact_survey(
             ref_result = r   # first (clean) run is the reference
 
     # ── Cluster-quality metrics ───────────────────────────────────────────────
-    survey_metrics: Dict[str, "ClusterQualityMetrics"] = {}
+    survey_metrics: Dict[str, ClusterQualityMetrics] = {}
     if compute_metrics:
         if verbose:
             print(f"\n[survey] Computing cluster-quality metrics ({n_runs} runs)…")
@@ -758,12 +796,9 @@ def run_artifact_survey(
                 )
             except Exception as exc:
                 import warnings
-                warnings.warn(f"[survey] metrics failed for '{tag}': {exc}")
+                warnings.warn(f"[survey] metrics failed for '{tag}': {exc}", stacklevel=2)
         if verbose:
             _print_survey_metrics_table(survey_metrics, algorithm)
-
-    # ── Compute ground-truth histogram ────────────────────────────────────────
-    hist_gt = compute_ground_truth_histogram(sim.phantom, bins=histogram_bins)
 
     # ── Figure layout ─────────────────────────────────────────────────────────
     # Row 0: [GT scatter] [clean] [noise moderate] [noise low]
@@ -832,7 +867,7 @@ def run_artifact_survey(
 # ── Survey metrics table ──────────────────────────────────────────────────────
 
 def _print_survey_metrics_table(
-    metrics: Dict[str, "ClusterQualityMetrics"],
+    metrics: Dict[str, ClusterQualityMetrics],
     algorithm: str,
 ) -> None:
     """Print a ranked ASCII table of DB index and mean centroid error."""
@@ -844,7 +879,7 @@ def _print_survey_metrics_table(
     col_tag = 34
     sep = "\u2500" * (col_tag + 28)
     print("\n  Cluster quality \u2014 " + algorithm + " survey")
-    print(f"  (ranked by Davies-Bouldin index, lower = better)")
+    print("  (ranked by Davies-Bouldin index, lower = better)")
     print(f"  {sep}")
     _ce_hdr = "Mean CE [cm\u207b\u00b9]"
     _hdr_a = "Artifact scenario"
@@ -865,7 +900,7 @@ def _print_survey_metrics_table(
 
 def _draw_gt_scatter_panel(
     subfig: plt.Figure,
-    phantom: "PhantomData",
+    phantom: PhantomData,
     title: str,
     shared_extent: List[float],
     energy_idx: int = 6,
@@ -890,8 +925,8 @@ def _draw_gt_scatter_panel(
     x_max = shared_extent[1]
     n_max = shared_extent[3]
 
-    for i, (m, mx, mn, sz, col) in enumerate(
-            zip(materials, mu_x_vals, mu_n_vals, sizes, colours)):
+    for m, mx, mn, sz, col in zip(
+            materials, mu_x_vals, mu_n_vals, sizes, colours):
         # Cross-hairs
         ax.axvline(mx, color=col, linewidth=0.5, alpha=0.3, zorder=1)
         ax.axhline(mn, color=col, linewidth=0.5, alpha=0.3, zorder=1)
@@ -924,7 +959,7 @@ def _draw_gt_scatter_panel(
 
 def _draw_survey_histogram_panel(
     subfig: plt.Figure,
-    hist: "HistogramResult",
+    hist: HistogramResult,
     title: str,
     log_scale: bool,
     cmap: str,
@@ -932,7 +967,7 @@ def _draw_survey_histogram_panel(
     gt_mu_x: Optional[np.ndarray] = None,
     gt_mu_n: Optional[np.ndarray] = None,
     materials: Optional[list] = None,
-    metrics: Optional["ClusterQualityMetrics"] = None,
+    metrics: Optional[ClusterQualityMetrics] = None,
 ) -> None:
     """Single histogram panel for the survey grid (no marginals, compact).
 

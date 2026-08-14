@@ -1,0 +1,11 @@
+# Default reviewers for anything not matched below.
+*                                       @OriolSansPlanell
+
+# Physical data changes everyone's results — review these carefully.
+/neutron_xray_sim/materials/            @OriolSansPlanell
+/neutron_xray_sim/lib/xray_data/        @OriolSansPlanell
+
+# Pipeline core.
+/neutron_xray_sim/projector.py          @OriolSansPlanell
+/neutron_xray_sim/reconstructor.py      @OriolSansPlanell
+/neutron_xray_sim/artifacts.py          @OriolSansPlanell

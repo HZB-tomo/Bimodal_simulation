@@ -26,17 +26,19 @@ Volume-domain artifacts (applied after reconstruction):
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Optional, Tuple
+
 import numpy as np
-from dataclasses import dataclass, field
-from typing import Optional, List, Tuple
-from scipy.ndimage import (
-    gaussian_filter,
-    affine_transform,
-    map_coordinates,
-)
+from scipy.ndimage import affine_transform, gaussian_filter
 from scipy.spatial.transform import Rotation
 
-__all__ = ["ArtifactConfig", "inject_sinogram_artifacts", "inject_volume_artifacts"]
+__all__ = [
+    "ArtifactConfig",
+    "inject_sinogram_artifacts",
+    "inject_volume_artifacts",
+    "PRESET_CONFIGS",
+]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -165,22 +167,22 @@ class ArtifactConfig:
     # ──────────────────────────────────────────────────────────────────────────
 
     @classmethod
-    def clean(cls) -> "ArtifactConfig":
+    def clean(cls) -> ArtifactConfig:
         """All artifacts disabled — clean reference simulation."""
         return cls()
 
     @classmethod
-    def noise_only(cls, I0: float = 5e4) -> "ArtifactConfig":
+    def noise_only(cls, I0: float = 5e4) -> ArtifactConfig:
         """Poisson counting noise only."""
         return cls(photon_noise=True, I0_xray=I0, I0_neutron=I0)
 
     @classmethod
-    def beam_hardening_only(cls) -> "ArtifactConfig":
+    def beam_hardening_only(cls) -> ArtifactConfig:
         """Polychromatic BH artifact without any BHC."""
         return cls(apply_bh_correction=False)
 
     @classmethod
-    def scatter_only(cls) -> "ArtifactConfig":
+    def scatter_only(cls) -> ArtifactConfig:
         """Scatter artifacts (neutron + X-ray) only."""
         return cls(
             neutron_scatter=True, scatter_fraction=0.06,
@@ -189,13 +191,13 @@ class ArtifactConfig:
 
     @classmethod
     def misalignment_only(cls, translation: Tuple = (3.0, 0.0, 0.0),
-                           rotation: Tuple = (0.0, 1.5, 0.0)) -> "ArtifactConfig":
+                           rotation: Tuple = (0.0, 1.5, 0.0)) -> ArtifactConfig:
         """Rigid-body misalignment between the two modalities only."""
         return cls(misalignment=True,
                    translation_voxels=translation, rotation_deg=rotation)
 
     @classmethod
-    def realistic(cls) -> "ArtifactConfig":
+    def realistic(cls) -> ArtifactConfig:
         """All physical artifacts at moderate realistic levels."""
         return cls(
             photon_noise=True,         I0_xray=5e4, I0_neutron=3e4,
@@ -209,15 +211,30 @@ class ArtifactConfig:
                                        rotation_deg=(0.0, 0.8, 0.0),
         )
 
+    def is_clean(self) -> bool:
+        """True when no artifact is enabled.
+
+        Beam hardening is *not* an artifact switch: it emerges from the
+        polychromatic forward projection whether or not anything is enabled,
+        and ``apply_bh_correction`` only chooses whether to correct it.  A run
+        with everything off is therefore still "clean".
+        """
+        return not any((
+            self.photon_noise, self.neutron_scatter, self.xray_scatter,
+            self.detector_psf, self.ring_artifacts, self.misalignment,
+            self.salt_pepper, self.apply_bh_correction,
+        ))
+
     def summary(self) -> str:
         """One-line human-readable summary of active artifacts."""
+        if self.is_clean():
+            return "clean (no artifacts)"
+
         active = []
         if self.photon_noise:
             active.append(f"noise(I0_x={self.I0_xray:.0e}, I0_n={self.I0_neutron:.0e})")
         if self.apply_bh_correction:
             active.append(f"BHC(order={self.bh_correction_order})")
-        else:
-            active.append("BH_artifact(no_correction)")
         if self.neutron_scatter:
             active.append(f"n_scatter(f={self.scatter_fraction:.2f})")
         if self.xray_scatter:
@@ -234,7 +251,7 @@ class ArtifactConfig:
             active.append(f"misalign(T={t},R={r})")
         if self.salt_pepper:
             active.append(f"salt_pepper(f={self.salt_pepper_fraction:.4f})")
-        return " | ".join(active) if active else "clean (no artifacts)"
+        return " | ".join(active)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -264,19 +281,18 @@ def inject_sinogram_artifacts(
     if rng is None:
         rng = np.random.default_rng(0)
 
-    # Work on copies
-    x_lam = xray_sino["sino_lam"].copy()
-    n_lam = neutron_sino["sino_lam"].copy()
-    x_trans = xray_sino["sino_trans"].copy()
-    n_trans = neutron_sino["sino_trans"].copy()
-
-    I0_x = cfg.I0_xray
-    I0_n = cfg.I0_neutron
+    # ``sino_lam`` is the single running state; transmission is derived from it
+    # whenever a step needs it.  Carrying a second, independently-updated
+    # ``sino_trans`` used to silently discard earlier steps: the scatter models
+    # rebuilt their output from the *raw* transmission, so a beam-hardening
+    # correction applied just before was thrown away.
+    x_lam = np.array(xray_sino["sino_lam"], dtype=np.float32, copy=True)
+    n_lam = np.array(neutron_sino["sino_lam"], dtype=np.float32, copy=True)
 
     # ── 1. Poisson photon noise ───────────────────────────────────────────────
     if cfg.photon_noise:
-        x_lam, x_trans = _apply_poisson_noise(x_trans, I0_x, rng)
-        n_lam, n_trans = _apply_poisson_noise(n_trans, I0_n, rng)
+        x_lam = _apply_poisson_noise(_transmission(x_lam), cfg.I0_xray, rng)
+        n_lam = _apply_poisson_noise(_transmission(n_lam), cfg.I0_neutron, rng)
 
     # ── 2. Beam-hardening correction (optional) ───────────────────────────────
     if cfg.apply_bh_correction:
@@ -285,7 +301,7 @@ def inject_sinogram_artifacts(
     # ── 3. Neutron scatter build-up ───────────────────────────────────────────
     if cfg.neutron_scatter:
         n_lam = _apply_neutron_scatter(
-            n_lam, n_trans,
+            n_lam,
             fraction=cfg.scatter_fraction,
             sigma=cfg.scatter_sigma_pixels,
             D_over_L=cfg.scatter_D_over_L,
@@ -294,7 +310,7 @@ def inject_sinogram_artifacts(
     # ── 4. X-ray scatter ─────────────────────────────────────────────────────
     if cfg.xray_scatter:
         x_lam = _apply_xray_scatter(
-            x_lam, x_trans,
+            x_lam,
             fraction=cfg.xray_scatter_fraction,
             sigma=cfg.xray_scatter_sigma_pixels,
         )
@@ -315,13 +331,33 @@ def inject_sinogram_artifacts(
 
     x_out = dict(xray_sino)
     x_out["sino_lam"] = x_lam
-    x_out["sino_trans"] = np.exp(-x_lam)
+    x_out["sino_trans"] = _transmission(x_lam)
+    x_out["I0"] = cfg.I0_xray
 
     n_out = dict(neutron_sino)
     n_out["sino_lam"] = n_lam
-    n_out["sino_trans"] = np.exp(-n_lam)
+    n_out["sino_trans"] = _transmission(n_lam)
+    n_out["I0"] = cfg.I0_neutron
 
     return x_out, n_out
+
+
+def _transmission(sino_lam: np.ndarray) -> np.ndarray:
+    """Transmission implied by a log-attenuation sinogram: ``T = exp(−λ)``."""
+    return np.exp(-sino_lam)
+
+
+def _blur_projections(stack: np.ndarray, sigma: float) -> np.ndarray:
+    """Gaussian-blur each ``(n_slices, n_det)`` projection in a sinogram stack.
+
+    ``gaussian_filter`` is separable and handles N-D input directly, so a
+    per-axis sigma of ``(0, σ, σ)`` blurs within each projection without
+    mixing angles.  The previous two-level Python loop called the filter
+    ``n_angles × n_slices`` times for the same result.
+    """
+    if sigma <= 0:
+        return stack
+    return gaussian_filter(stack, sigma=(0.0, sigma, sigma), mode="nearest")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -375,21 +411,24 @@ def _apply_poisson_noise(
     transmission: np.ndarray,
     I0: float,
     rng: np.random.Generator,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> np.ndarray:
     """
     Add Poisson counting noise to a transmission sinogram.
 
-    Model:
+    Model::
+
         detected = Poisson(I0 · T)
         T_noisy  = detected / I0
         λ_noisy  = −log(T_noisy)
+
+    Returns the noisy log-attenuation sinogram.
     """
-    counts      = rng.poisson(np.clip(transmission, 0, 1) * I0).astype(np.float32)
-    t_noisy     = counts / I0
-    eps         = 0.5 / I0        # half-count floor avoids log(0)
-    t_noisy     = np.clip(t_noisy, eps, 1.0)
-    lam_noisy   = -np.log(t_noisy)
-    return lam_noisy, t_noisy
+    if I0 <= 0:
+        raise ValueError(f"Incident count I0 must be positive, got {I0!r}.")
+    counts    = rng.poisson(np.clip(transmission, 0, 1) * I0).astype(np.float32)
+    eps       = 0.5 / I0          # half-count floor avoids log(0)
+    t_noisy   = np.clip(counts / I0, eps, 1.0)
+    return -np.log(t_noisy)
 
 
 def _apply_bh_correction(
@@ -419,65 +458,58 @@ def _apply_bh_correction(
     return np.clip(corrected, 0, None)
 
 
+def _add_scatter_halo(
+    sino_lam: np.ndarray, fraction: float, sigma: float
+) -> np.ndarray:
+    """Add a blurred copy of the primary beam as a scattered background.
+
+    Model::
+
+        I_detected = I_primary + f · blur_σ(I_primary)
+
+    Both modalities share this: neutron scatter build-up and X-ray
+    Compton/Rayleigh scatter differ only in *fraction* and *sigma*.  Working
+    from *sino_lam* (rather than a separately-tracked transmission array) keeps
+    the artifact chain composable — whatever ran before this step is preserved.
+    """
+    if fraction <= 0:
+        return sino_lam
+    I_primary = _transmission(sino_lam)
+    I_detected = I_primary + fraction * _blur_projections(I_primary, sigma)
+    return -np.log(np.clip(I_detected, 1e-9, None))
+
+
 def _apply_neutron_scatter(
     sino_lam: np.ndarray,
-    sino_trans: np.ndarray,
     fraction: float = 0.05,
     sigma: float = 8.0,
     D_over_L: float = 100.0,
 ) -> np.ndarray:
     """
-    Add scattered neutron contribution modelled as a Gaussian halo.
+    Add a scattered neutron contribution modelled as a Gaussian halo.
 
-    In neutron imaging the scattered fraction can be 5-15% for thick samples.
-    The collimation ratio D/L determines the solid angle of scatter collection:
-    larger D/L → more scatter reaches the detector.
-
-    Model:
-        I_detected = I_primary + f · I_primary_blurred
+    In neutron imaging the scattered fraction reaches 5–15 % for thick
+    hydrogenous samples.  The collimation ratio D/L sets the solid angle over
+    which scatter is collected: a looser collimation (small D/L) admits more.
     """
-    # Collimation factor: normalise so D/L=100 (tight) gives fraction as-is,
-    # D/L=10 (loose) scales up by factor 3
-    dl_scale = np.clip((D_over_L / 100.0) ** 0.5, 0.3, 3.0)
-    f_eff    = fraction * dl_scale
-
-    I_primary = sino_trans        # shape (n_angles, N, N)
-    # Blur the scatter source (halo around sample edges)
-    scatter_map = np.zeros_like(I_primary)
-    for a_idx in range(I_primary.shape[0]):
-        for s_idx in range(I_primary.shape[1]):
-            scatter_map[a_idx, s_idx] = gaussian_filter(
-                I_primary[a_idx, s_idx], sigma=sigma
-            )
-
-    I_detected = I_primary + f_eff * scatter_map
-    eps = 1e-9
-    return -np.log(np.clip(I_detected, eps, None))
+    # Normalised so that D/L = 100 (tight) reproduces *fraction* as given, and
+    # D/L = 10 (loose) roughly triples it.
+    dl_scale = float(np.clip((D_over_L / 100.0) ** 0.5, 0.3, 3.0))
+    return _add_scatter_halo(sino_lam, fraction * dl_scale, sigma)
 
 
 def _apply_xray_scatter(
     sino_lam: np.ndarray,
-    sino_trans: np.ndarray,
     fraction: float = 0.03,
     sigma: float = 20.0,
 ) -> np.ndarray:
     """
-    Add Compton/Rayleigh scatter to X-ray sinogram (cupping model).
+    Add Compton/Rayleigh scatter to the X-ray sinogram (cupping model).
 
-    X-ray scatter produces a broad low-frequency background that causes
-    cupping in the reconstructed volume and diagonal smearing in the
-    bimodal histogram.
+    X-ray scatter is a broad, low-frequency background that produces cupping in
+    the reconstructed volume and diagonal smearing in the bimodal histogram.
     """
-    I_primary = sino_trans
-    scatter_map = np.zeros_like(I_primary)
-    for a_idx in range(I_primary.shape[0]):
-        for s_idx in range(I_primary.shape[1]):
-            scatter_map[a_idx, s_idx] = gaussian_filter(
-                I_primary[a_idx, s_idx], sigma=sigma
-            )
-    I_detected = I_primary + fraction * scatter_map
-    eps = 1e-9
-    return -np.log(np.clip(I_detected, eps, None))
+    return _add_scatter_halo(sino_lam, fraction, sigma)
 
 
 def _apply_psf(sino_lam: np.ndarray, sigma: float) -> np.ndarray:
@@ -485,18 +517,9 @@ def _apply_psf(sino_lam: np.ndarray, sigma: float) -> np.ndarray:
     Convolve each projection image with a Gaussian PSF.
 
     Models scintillator light spread (X-ray: CsI, Gd₂O₂S; neutron: LiF/ZnS).
-    Applied in the sinogram domain (before reconstruction) to simulate
-    the reduced MTF of the detector system.
+    Applied in the sinogram domain to simulate the reduced detector MTF.
     """
-    if sigma <= 0:
-        return sino_lam
-    blurred = np.zeros_like(sino_lam)
-    for a_idx in range(sino_lam.shape[0]):
-        for s_idx in range(sino_lam.shape[1]):
-            blurred[a_idx, s_idx] = gaussian_filter(
-                sino_lam[a_idx, s_idx], sigma=sigma
-            )
-    return blurred
+    return _blur_projections(sino_lam, sigma)
 
 
 def _apply_ring_artifacts(
@@ -512,13 +535,16 @@ def _apply_ring_artifacts(
     concentric rings in the reconstructed volume and vertical/horizontal
     streaks in the sinogram.
     """
-    N_det   = sino_lam.shape[-1]
+    N_det = sino_lam.shape[-1]
+    n_bad = int(min(max(n_bad, 0), N_det))
+    if n_bad == 0:
+        return sino_lam
+
     bad_cols = rng.choice(N_det, size=n_bad, replace=False)
-    offsets  = rng.uniform(-amplitude, amplitude, size=n_bad)
+    offsets = rng.uniform(-amplitude, amplitude, size=n_bad)
 
     result = sino_lam.copy()
-    for col, off in zip(bad_cols, offsets):
-        result[:, :, col] += off
+    result[..., bad_cols] += offsets
     return result
 
 
@@ -535,7 +561,6 @@ def _apply_misalignment(
 
     The transform is applied around the volume centre to avoid offset bias.
     """
-    N      = vol.shape[0]
     center = np.array(vol.shape) / 2.0
 
     # Build rotation matrix from Euler angles (extrinsic xyz convention)

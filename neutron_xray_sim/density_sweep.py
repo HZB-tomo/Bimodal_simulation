@@ -1,10 +1,11 @@
 """Density-sweep helpers for planar NMC particle simulations."""
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from pathlib import Path
 from typing import Sequence
-import json
+
 import numpy as np
 import pandas as pd
 

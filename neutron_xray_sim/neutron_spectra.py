@@ -82,7 +82,7 @@ Public API
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, Optional, Sequence
 
 import numpy as np
 
@@ -528,9 +528,11 @@ def mu_n_spectrum_lut(materials, beam: NeutronBeam, n_bins=None):
         for g in groups:
             wg = w[g].sum()
             Eg = float(np.average(E[g], weights=w[g])) if wg > 0 else float(E[g].mean())
-            E_r.append(Eg); w_r.append(wg)
+            E_r.append(Eg)
+            w_r.append(wg)
         E = np.asarray(E_r, dtype=float)
-        w = np.asarray(w_r, dtype=float); w = w / w.sum()
+        w = np.asarray(w_r, dtype=float)
+        w = w / w.sum()
 
     scale = np.sqrt(_E0_MEV / E)                     # 1/v absorption factor / energy
     mu_lut = np.zeros((len(materials), E.size), dtype=np.float32)
@@ -607,7 +609,7 @@ Add custom beams with cold_mono_beam() or cold_poly_beam().
 def plot_spectra(
     beams:   Optional[Dict[str, NeutronBeam]] = None,
     figsize: tuple = (8, 4),
-) -> "plt.Figure":  # noqa: F821
+) -> plt.Figure:  # noqa: F821
     """
     Plot flux vs energy for one or more NeutronBeam objects.
 

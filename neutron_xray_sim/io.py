@@ -13,12 +13,13 @@ Directory layout
 
     <root>/
     ├── phantom/
-    │   ├── label_vol.npy          – (N, N, N) uint8 material labels
-    │   ├── mu_x_vol_<e>keV.npy    – (N, N, N) X-ray mu at each energy bin
-    │   ├── mu_n_abs_vol.npy       – (N, N, N) neutron absorption mu
-    │   ├── mu_n_coh_vol.npy       – (N, N, N) neutron coherent scatter mu
-    │   ├── mu_n_inc_vol.npy       – (N, N, N) neutron incoherent scatter mu
-    │   └── meta.json              – N, voxel_cm, preset, materials list
+    │   ├── label_vol.npy          – (Nz, Nx, Ny) uint8 material labels
+    │   ├── meta.json              – geometry + full material specs
+    │   └── (optional, save_derived_volumes=True)
+    │       ├── mu_x_vol_<e>keV.npy   – X-ray mu at each energy bin
+    │       ├── mu_n_abs_vol.npy      – neutron absorption mu
+    │       ├── mu_n_coh_vol.npy      – neutron coherent scatter mu
+    │       └── mu_n_inc_vol.npy      – neutron incoherent scatter mu
     │
     ├── sinograms/
     │   ├── xray_sino_lam.npy      – (n_angles, N, N) log-attenuation
@@ -83,7 +84,11 @@ Usage
 
 Schema version
 --------------
-Current version is ``"1.0"``.  Breaking changes will increment to ``"2.0"``.
+Current version is ``"1.1"``: ``phantom/meta.json`` gained a ``material_specs``
+block and the derived attenuation volumes became optional, since they are
+reproducible from the label volume plus the materials.  A cache written by
+schema 1.0 still loads for sinograms, volumes and histograms; only
+:meth:`SimCache.load_phantom` needs the newer metadata.
 """
 
 from __future__ import annotations
@@ -91,15 +96,14 @@ from __future__ import annotations
 import json
 import re
 import shutil
-import warnings
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List
 
 import numpy as np
 
 __all__ = ["SimCache", "tag_to_slug"]
 
-_SCHEMA_VERSION = "1.0"
+_SCHEMA_VERSION = "1.1"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -206,61 +210,129 @@ class SimCache:
     # Phantom
     # ─────────────────────────────────────────────────────────────────────────
 
-    def save_phantom(self, phantom) -> None:
+    def save_phantom(self, phantom, save_derived_volumes: bool = False) -> None:
         """
-        Persist all phantom arrays and metadata.
+        Persist the phantom.
 
         Saves
         -----
-        * ``phantom/label_vol.npy``      – uint8 label volume
-        * ``phantom/mu_x_vol_<E>keV.npy`` for every energy in the lookup table
-        * ``phantom/mu_n_abs_vol.npy``
-        * ``phantom/mu_n_coh_vol.npy``
-        * ``phantom/mu_n_inc_vol.npy``
-        * ``phantom/meta.json``
+        * ``phantom/label_vol.npy``  – uint8 label volume
+        * ``phantom/meta.json``      – geometry plus the full material specs
+
+        The attenuation volumes are **not** written by default.  They are a
+        pure function of the label volume and the materials, both of which are
+        saved, so :meth:`load_phantom` rebuilds them exactly.  Writing them out
+        used to cost 16 extra copies of the volume on disk — 13 X-ray energies
+        plus 3 neutron channels, about 7 GB for a 512³ phantom.
 
         Parameters
         ----------
         phantom : PhantomData
+        save_derived_volumes :
+            Also write the neutron and per-energy X-ray volumes, for tools that
+            read the cache directly instead of going through ``load_phantom``.
         """
         d = self.phantom_dir
 
-        # Label volume (uint8)
         p = d / "label_vol.npy"
         self._guard(p)
         np.save(p, phantom.label_vol.astype(np.uint8))
 
-        # X-ray mu volumes at each energy
-        from .materials import XRAY_E_KEV
-        for e_idx, e_kev in enumerate(XRAY_E_KEV):
-            fname = d / f"mu_x_vol_{int(round(e_kev)):03d}keV.npy"
-            self._guard(fname)
-            _save_npy(fname, phantom.mu_x_vols[e_idx])
+        if save_derived_volumes:
+            from .materials import XRAY_E_KEV
+            for e_idx, e_kev in enumerate(XRAY_E_KEV):
+                fname = d / f"mu_x_vol_{int(round(e_kev)):03d}keV.npy"
+                self._guard(fname)
+                _save_npy(fname, phantom.mu_x_at_index(e_idx))
 
-        # Neutron mu volumes
-        for name, vol in [
-            ("mu_n_abs_vol", phantom.mu_n_abs_vol),
-            ("mu_n_coh_vol", phantom.mu_n_coh_vol),
-            ("mu_n_inc_vol", phantom.mu_n_inc_vol),
-        ]:
-            p = d / f"{name}.npy"
-            self._guard(p)
-            _save_npy(p, vol)
+            for name, vol in [
+                ("mu_n_abs_vol", phantom.mu_n_abs_vol),
+                ("mu_n_coh_vol", phantom.mu_n_coh_vol),
+                ("mu_n_inc_vol", phantom.mu_n_inc_vol),
+            ]:
+                p = d / f"{name}.npy"
+                self._guard(p)
+                _save_npy(p, vol)
 
-        # Metadata
         meta = {
             "schema_version": _SCHEMA_VERSION,
             "name":           phantom.name,
             "N":              int(phantom.N),
+            "Nz":             int(phantom.Nz),
+            "Nx":             int(phantom.Nx),
+            "Ny":             int(phantom.Ny),
             "voxel_cm":       float(phantom.voxel_cm),
             "materials":      [m.name for m in phantom.materials],
             "n_materials":    len(phantom.materials),
+            # Full numeric definition of every material, so a cached phantom is
+            # self-describing even if the material database changes later.
+            "material_specs": [m.as_dict() for m in phantom.materials],
         }
         _write_json(d / "meta.json", meta)
 
     def load_phantom_meta(self) -> dict:
         """Return the phantom metadata dict."""
         return _read_json(self.phantom_dir / "meta.json")
+
+    def load_phantom(self):
+        """Rebuild the cached :class:`~neutron_xray_sim.phantom.PhantomData`.
+
+        Materials are restored from the ``material_specs`` block written by
+        :meth:`save_phantom`, so the reloaded phantom carries the exact numbers
+        used in the original run rather than whatever the current material
+        database happens to say.
+
+        Raises
+        ------
+        FileNotFoundError
+            If no phantom has been saved to this cache.
+        """
+        import numpy as _np
+
+        from .materials import Material
+        from .phantom import PhantomData
+
+        meta_path = self.phantom_dir / "meta.json"
+        if not meta_path.exists():
+            raise FileNotFoundError(
+                f"No phantom in this cache ({meta_path} is missing). "
+                "Call save_phantom() first, or point SimCache at a populated "
+                "results directory."
+            )
+        meta = _read_json(meta_path)
+        label_vol = _load_npy(self.phantom_dir / "label_vol.npy")
+
+        specs = meta.get("material_specs")
+        if not specs:
+            raise ValueError(
+                f"{meta_path} predates schema 1.1 and has no 'material_specs' "
+                "block, so the materials cannot be restored. Re-run "
+                "save_phantom() with this version to upgrade the cache."
+            )
+        materials = [
+            Material(
+                name=s["name"], symbol=s["symbol"],
+                density_gcc=s["density_gcc"],
+                mu_n_abs=s["mu_n_abs"], mu_n_coh=s["mu_n_coh"],
+                mu_n_inc=s["mu_n_inc"],
+                mu_x_table=_np.asarray(s["mu_x_cm"], dtype=float),
+                color=s.get("color", "#888888"),
+                key=s.get("key", ""), reference=s.get("reference", ""),
+                tags=tuple(s.get("tags", ())),
+            )
+            for s in specs
+        ]
+
+        Nz, Nx, Ny = label_vol.shape
+        return PhantomData(
+            Nz=int(meta.get("Nz", Nz)),
+            Nx=int(meta.get("Nx", Nx)),
+            Ny=int(meta.get("Ny", Ny)),
+            voxel_cm=float(meta["voxel_cm"]),
+            label_vol=label_vol.astype(np.uint8),
+            materials=materials,
+            name=meta.get("name", "phantom"),
+        )
 
     def phantom_exists(self) -> bool:
         """Return True if a phantom has been saved."""
@@ -522,7 +594,7 @@ class SimCache:
         -------
         HistogramResult
         """
-        from .histogram import HistogramResult, compute_bimodal_histogram
+        from .histogram import HistogramResult
         d = self.run_dir(tag)
         H       = _load_npy(d / "histogram_H.npy")
         x_edges = _load_npy(d / "histogram_x_edges.npy")

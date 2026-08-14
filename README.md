@@ -1,14 +1,14 @@
-# Bimodal_simulation
+# DIANA
 
 **A simulation toolkit for dual-modality neutron / X-ray tomography and bimodal-histogram analysis.**
 
-Python package import name: `neutron_xray_sim` · Version 1.1.0
+Python package import name: `neutron_xray_sim` · Version 1.2.0
 
 ---
 
 ## What this is
 
-`Bimodal_simulation` is an end-to-end simulator for **combined neutron and X-ray
+DIANA is an end-to-end simulator for **combined neutron and X-ray
 computed tomography**. The two modalities are complementary: X-rays are strongly
 attenuated by heavy elements (metals, bone mineral), while thermal neutrons are
 attenuated mainly by light, hydrogen-rich materials (water, polymers, organics).
@@ -61,9 +61,16 @@ chain is wrapped by the `DualModalitySimulation` orchestrator.
 Requires Python ≥ 3.9.
 
 ```bash
-git clone https://github.com/HZB-tomo/Bimodal_simulation.git
-cd Bimodal_simulation
-pip install -r requirements.txt
+git clone https://github.com/OriolSansPlanell/DIANA.git
+cd DIANA
+pip install -e .
+```
+
+For development, including the test suite and linter:
+
+```bash
+pip install -e ".[dev]"
+pytest
 ```
 
 The core dependencies (NumPy, SciPy, scikit-image, matplotlib, scikit-learn) are all
@@ -118,8 +125,12 @@ Four runnable example scripts (`01`–`04`) reproduce the main figures; see
 | `battery` | Alkaline AAA cell cross-section (~1.4 cm) | Electrolyte and separator visible only with neutrons |
 | `bone_implant` | Cortical bone + Ti implant (~1 cm) | Neutrons resolve the bone–metal interface where X-rays starve |
 | `industrial` | Multi-material part with W and Fe inserts | Beam hardening and neutron complementarity in NDE |
-| `jellyroll_battery` | Wound cylindrical cell | Layered electrode structure |
+| `jellyroll_battery` | Cylindrical Li-ion cell, concentric turns | Layered electrode structure |
+| `spiral_battery` | Cylindrical Li-ion cell, Archimedean spiral | True wound jellyroll geometry |
 | `HDPE_composite` | HDPE block with steel rod, Al/Fe cubes, voids | Mixed-density inclusions and air bubbles |
+
+List them at runtime with `PHANTOM_DESCRIPTIONS`, and add your own with the
+`@register_phantom` decorator — see [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 You can also build phantoms primitive-by-primitive with `PhantomBuilder`, or import a
 real segmented volume — see [`docs/phantoms.md`](docs/phantoms.md) and
@@ -152,40 +163,72 @@ Factory presets: `ArtifactConfig.clean()`, `.noise_only()`, `.beam_hardening_onl
 
 ## Repository layout
 
-The repository ships the importable package `neutron_xray_sim` plus example scripts
-and reference notes. The expected structure (mirroring the package's import name) is:
-
 ```
-Bimodal_simulation/
+DIANA/
 ├── neutron_xray_sim/          # the Python package (import name)
 │   ├── __init__.py            # public API and version
-│   ├── materials.py           # material database, formula + composite builders
-│   ├── phantom.py             # PhantomData, PhantomBuilder, preset phantoms
+│   ├── materials/             # material registry — see below
+│   │   ├── elements.py        #   per-element constants, NIST table reader
+│   │   ├── core.py            #   Material, MaterialSpec, builder, validator
+│   │   ├── registry.py        #   MaterialRegistry, the package-wide MATERIALS
+│   │   └── database.py        #   the built-in catalogue, as data
+│   ├── phantom.py             # PhantomData, PhantomBuilder, preset registry
 │   ├── projector.py           # polychromatic X-ray + thermal neutron projection
 │   ├── artifacts.py           # ArtifactConfig + artifact injection
 │   ├── reconstructor.py       # FBP / SIRT / CGLS / … reconstruction
 │   ├── histogram.py           # bimodal histogram, GMM, segmentation, metrics
 │   ├── simulation.py          # DualModalitySimulation orchestrator
-│   ├── neutron_spectra.py     # thermal / cold / ILL-NeXT neutron beam models
-│   ├── volume_importer.py     # build phantoms from real segmented volumes
+│   ├── neutron_spectra.py     # thermal / cold / ILL-NeXT beam models
+│   ├── volume_importer.py     # phantoms from real segmented volumes
 │   ├── metrics_table.py       # tabulated cluster-quality metrics
+│   ├── noise.py               # dose models and detectability metrics
 │   ├── io.py                  # on-disk SimCache for pipeline stages
 │   ├── diana_plots.py         # publication-figure plotting helpers
 │   └── lib/xray_data/         # NIST XCOM μ/ρ tables (one file per element)
-├── notebooks/
-│   ├── 01_artifact_comparison.py
-│   ├── 02_misalignment_sweep.py
-│   ├── 03_gmm_segmentation.py
-│   └── 04_phantom_showcase.py
-├── docs/                      # the documentation in this folder
-├── requirements.txt
-└── README.md
+├── notebooks/                 # worked examples and example scripts
+├── tests/                     # CPU-only test suite (pytest)
+├── docs/                      # documentation
+├── CONTRIBUTING.md            # how to add a material, phantom, or artifact
+├── CHANGELOG.md
+└── pyproject.toml
 ```
 
-> **Note on names.** The GitHub repository is `Bimodal_simulation`; the Python package
-> you import is `neutron_xray_sim`. Keep the package directory named `neutron_xray_sim`
-> so imports resolve. The example scripts add the repo root to `sys.path` before
-> importing.
+> **Note on names.** The repository is `DIANA`; the Python package you import is
+> `neutron_xray_sim`. Keep the package directory named `neutron_xray_sim` so imports
+> resolve.
+
+---
+
+## Materials
+
+Materials are declarative. Each one is a `MaterialSpec` saying where its numbers come
+from — a chemical formula, a mixture of phases, or an explicit table — and a single
+validated builder turns specs into `Material` objects.
+
+```python
+from neutron_xray_sim import MATERIALS
+
+print(MATERIALS.table())              # readable overview
+MATERIALS.names(tag="battery")        # filter by tag
+MATERIALS.audit()                     # data-quality report
+MATERIALS.load_file("my_materials.json")   # project-specific additions
+```
+
+`MATERIALS` is still a mapping, so `MATERIALS["hdpe"]` and `"steel" in MATERIALS`
+work as before. See [`docs/materials.md`](docs/materials.md).
+
+> **Data quality.** `MATERIALS.audit()` currently flags the shipped X-ray tables for
+> `hdpe`, `bone` and `lead` as inconsistent with NIST. The values are preserved so
+> existing results stay reproducible — see the changelog and `docs/materials.md`.
+
+---
+
+## Contributing
+
+DIANA is set up for several people to work on it at once. Each kind of extension has
+one obvious insertion point — a material spec, a `@register_phantom` decorator, an
+`ArtifactConfig` field — and a CPU-only test suite that runs in under a minute.
+Start with [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ---
 
@@ -207,6 +250,8 @@ or pasted into the GitHub wiki:
 - [Importing real segmented data](docs/importing-data.md)
 - [Example scripts](docs/examples.md)
 - [API reference](docs/api-reference.md)
+- [Roadmap](docs/roadmap.md)
+- [Changelog](CHANGELOG.md)
 
 ---
 

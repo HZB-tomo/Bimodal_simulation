@@ -10,7 +10,6 @@ Run:
 On Windows you can also double-click this file if Python is in PATH.
 """
 import sys
-import os
 from pathlib import Path
 
 HERE = Path(__file__).parent.resolve()
@@ -43,4 +42,5 @@ if not gui_path.exists():
 
 # Run as a module to keep imports clean
 import runpy
+
 runpy.run_path(str(gui_path), run_name="__main__")

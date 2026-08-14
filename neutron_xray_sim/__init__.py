@@ -167,6 +167,19 @@ from .diana_plots import (
 	
 )
 
+from .noise import(
+	add_poisson_noise,
+	add_poisson_noise_streaming,
+	predicted_sigma_lambda,
+	measure_sigma_lambda,
+	material_stats,
+	cnr,
+	d_prime,
+	joint_d_prime,
+	rose_dose_threshold,
+	
+)
+
 __version__  = "1.1.0"
 __author__   = "neutron_xray_sim contributors"
 

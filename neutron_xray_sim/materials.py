@@ -66,6 +66,7 @@ ATOMIC_MASS = {
     "Ni": 58.6934,
     "Mn": 54.938044,
     "In": 114.818,
+    "Zn": 65.38,      # <- added: ZnO in amazon_fcardoso2022 bone
 }
 
 # ── Microscopic thermal-neutron cross sections (barn) — extended ──────────────
@@ -91,6 +92,7 @@ NEUTRON_XS = {
     "Ni": {"abs": 4.49,    "coh": 13.3,    "inc": 5.2},
     "Mn": {"abs": 13.3,    "coh": 1.75,    "inc": 0.40},   # FIXED coh 2.15 -> 1.75 (Sears 1992)
     "In": {"abs": 193.8,   "coh": 2.08,    "inc": 0.54},   # FIXED: was 7.43/0.079/0.02 (~26x too small)
+    "Zn": {"abs": 1.11,    "coh": 4.054,   "inc": 0.077},  # <- added: Sears (1992), natural Zn
 }
 
 
@@ -142,7 +144,8 @@ def _element_mu_over_rho(element: str) -> np.ndarray:
 def build_xray_mass_atten():
     # Extended element list: original + N, Mg, Al, Si, S, K, Ca
     elements = ["H", "Li", "C", "N", "O", "F", "Mg", "Al", "Si",
-                "P", "S", "Cl", "K", "Ca", "Fe", "Co", "Ni", "Mn", "In"]
+                "P", "S", "Cl", "K", "Ca", "Fe", "Co", "Ni", "Mn", "In",
+                "Zn"]   # <- Zn added: requires lib/xray_data/Zn.txt
     data = {}
     for el in elements:
         try:

@@ -14,6 +14,22 @@ Artifacts are applied in two domains:
 `inject_sinogram_artifacts(...)` and `inject_volume_artifacts(...)` perform the two
 stages; `DualModalitySimulation.run` calls them for you.
 
+## Order of application
+
+Sinogram-domain artifacts follow the physical detection chain:
+
+1. **Scatter** (neutron and X-ray) — a Gaussian halo of the primary intensity is added.
+2. **Detector PSF** — each projection *image* (slice × detector plane) is blurred in 2-D.
+3. **Poisson counting noise** — drawn from the blurred, scatter-contaminated intensity,
+   so blur never smooths the noise away.
+4. **Ring artifacts** — constant offsets on a few detector columns.
+5. **Beam-hardening correction** (optional) — a polynomial applied to the measured data.
+
+> Changed in 2.0: previously noise was drawn first and scatter/PSF were then applied to
+> the noisy data, and the scatter/PSF blur acted only along detector rows (1-D). Results
+> with `neutron_scatter`, `xray_scatter` or `detector_psf` enabled therefore differ from
+> 1.x. See `CHANGELOG.md`.
+
 ## Factory presets
 
 | Constructor | What it gives you |

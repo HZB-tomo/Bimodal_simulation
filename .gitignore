@@ -1,3 +1,28 @@
-.venv
-__pycache__
-results/volumes
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Simulation outputs (regenerate them; share large results via releases/Zenodo)
+results/volumes/
+outputs_disc_sweep/
+*.npy
+*.npz
+sim_cache*/
+cache/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

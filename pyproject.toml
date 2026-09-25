@@ -1,28 +1,79 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
-name            = "neutron_xray_sim"
-version         = "1.1.0"
-description     = "Dual-modality neutron/X-ray CT simulation and bimodal histogram analysis"
-readme          = "README.md"
+name = "neutron_xray_sim"
+dynamic = ["version"]
+description = "DIANA: dual-modality neutron/X-ray CT simulation and bimodal histogram analysis"
+readme = "README.md"
 requires-python = ">=3.9"
-license         = {text = "MIT"}
+license = { text = "MIT" }
+authors = [
+    { name = "Oriol Sans-Planell" },
+    { name = "Shahabeddin Dayani" },
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Physics",
+]
 dependencies = [
     "numpy>=1.24",
     "scipy>=1.10",
-    "scikit-image>=0.20",
-    "scikit-learn>=1.2",
+    "scikit-image>=0.21",
+    "scikit-learn>=1.3",
     "matplotlib>=3.7",
+    "pandas>=1.5",
 ]
 
 [project.optional-dependencies]
-gpu     = ["astra-toolbox>=1.9"]
-gridrec = ["tomopy>=1.14"]
-docs    = ["sphinx>=7", "sphinx-rtd-theme", "myst-parser"]
-dev     = ["pytest", "jupyter"]
+gpu       = ["astra-toolbox>=1.9"]            # usually installed with conda, see docs/installation.md
+gridrec   = ["tomopy>=1.14"]
+bragg     = ["ncrystal>=3.6"]
+tiff      = ["tifffile"]
+gui       = ["PyQt5"]
+notebooks = ["jupyterlab", "ipykernel", "tifffile"]
+dev       = ["pytest>=7", "pytest-cov", "ruff>=0.5", "nbmake", "nbstripout", "pre-commit"]
+
+[project.scripts]
+diana-gui = "neutron_xray_sim.gui.app:main"
+
+[project.urls]
+Repository = "https://github.com/OriolSansPlanell/DIANA"
+
+[tool.setuptools.dynamic]
+version = { attr = "neutron_xray_sim._version.__version__" }
 
 [tool.setuptools.packages.find]
-where = ["."]
 include = ["neutron_xray_sim*"]
+
+[tool.setuptools.package-data]
+"neutron_xray_sim.physics" = ["data/xray/*.txt"]
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "slow: end-to-end tests that run the full pipeline (deselect with -m 'not slow')",
+]
+filterwarnings = [
+    "ignore:ASTRA not available:UserWarning",
+]
+
+# ── Linting ───────────────────────────────────────────────────────────────────
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+extend-exclude = ["notebooks", "*.ipynb"]
+
+[tool.ruff.lint]
+# Pyflakes (real bugs: undefined names, unused imports/variables) + syntax errors.
+# Style rules are deliberately not enforced to keep diffs of existing code small.
+select = ["F", "E9", "B006", "B008"]
+
+[tool.ruff.lint.per-file-ignores]
+"neutron_xray_sim/__init__.py" = ["E402"]
+"neutron_xray_sim/gui/app.py" = ["F401", "F841"]

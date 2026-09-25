@@ -2,7 +2,9 @@
 
 This is where the simulation pays off: the reconstructed X-ray and neutron volumes are
 combined into a joint histogram, modelled with a Gaussian mixture, segmented back into
-phases, and scored against ground truth. Everything here lives in `histogram.py`.
+phases, and scored against ground truth. Everything here lives in the `neutron_xray_sim.analysis` subpackage (`histogram`, `gmm`,
+`signatures`, `quality`, `metrics_table`, `metrics_morphology`); figures are in
+`neutron_xray_sim.plotting`.
 
 ## The 2-D bimodal histogram
 

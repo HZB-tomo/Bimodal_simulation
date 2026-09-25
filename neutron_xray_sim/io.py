@@ -1,6 +1,6 @@
 """
-neutron_xray_sim/io.py
------------------------
+neutron_xray_sim.io
+-------------------
 Persistence layer for every stage of the dual-modality CT pipeline.
 
 All intermediate results are saved as ``.npy`` files under a structured
@@ -69,7 +69,7 @@ Usage
 
     # Reader side (standalone re-analysis)
     cache = SimCache("my_results/")
-    phantom     = cache.load_phantom()           # PhantomData
+    phantom     = cache.load_phantom()           # PhantomData (built-in materials)
     xray_sino   = cache.load_raw_xray_sino()     # dict
     vol_xray    = cache.load_run_volume("clean", modality="xray")
     hist        = cache.load_run_histogram("clean")
@@ -93,7 +93,7 @@ import re
 import shutil
 import warnings
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional
 
 import numpy as np
 
@@ -188,6 +188,10 @@ class SimCache:
         d.mkdir(parents=True, exist_ok=True)
         return d
 
+    def _run_path(self, tag: str) -> Path:
+        """Run directory without creating it (for read-only access)."""
+        return self.root / "runs" / tag_to_slug(tag)
+
     def survey_dir(self, survey_slug: str) -> Path:
         d = self.root / "survey" / survey_slug
         d.mkdir(parents=True, exist_ok=True)
@@ -231,7 +235,7 @@ class SimCache:
         np.save(p, phantom.label_vol.astype(np.uint8))
 
         # X-ray mu volumes at each energy
-        from .materials import XRAY_E_KEV
+        from .physics.materials import XRAY_E_KEV
         for e_idx, e_kev in enumerate(XRAY_E_KEV):
             fname = d / f"mu_x_vol_{int(round(e_kev)):03d}keV.npy"
             self._guard(fname)
@@ -252,8 +256,10 @@ class SimCache:
             "schema_version": _SCHEMA_VERSION,
             "name":           phantom.name,
             "N":              int(phantom.N),
+            "shape":          [int(v) for v in phantom.shape],
             "voxel_cm":       float(phantom.voxel_cm),
             "materials":      [m.name for m in phantom.materials],
+            "material_keys":  [_material_key(m) for m in phantom.materials],
             "n_materials":    len(phantom.materials),
         }
         _write_json(d / "meta.json", meta)
@@ -261,6 +267,66 @@ class SimCache:
     def load_phantom_meta(self) -> dict:
         """Return the phantom metadata dict."""
         return _read_json(self.phantom_dir / "meta.json")
+
+    def check_phantom(self, phantom) -> None:
+        """
+        Raise ``ValueError`` if the cached phantom does not match *phantom*
+        (different name, shape or voxel size) — i.e. the cache directory
+        belongs to another simulation.
+        """
+        meta = self.load_phantom_meta()
+        shape = meta.get("shape", [meta["N"]] * 3)
+        if (meta["name"] != phantom.name
+                or list(shape) != [int(v) for v in phantom.shape]
+                or not np.isclose(meta["voxel_cm"], phantom.voxel_cm)):
+            raise ValueError(
+                f"Cache at {self.root} holds phantom '{meta['name']}' "
+                f"{tuple(shape)} @ {meta['voxel_cm']} cm, but the simulation uses "
+                f"'{phantom.name}' {phantom.shape} @ {phantom.voxel_cm} cm. "
+                "Use a different cache_dir, or clear this one."
+            )
+
+    def load_phantom(self):
+        """
+        Rebuild the cached phantom as a ``PhantomData``.
+
+        Materials are looked up in ``MATERIALS`` (by key, then by name), so
+        custom materials must be registered with ``register_material`` first.
+        The saved attenuation volumes are restored as well, so phantoms whose
+        μ volumes were modified after construction round-trip exactly.
+        """
+        from .phantoms.base import PhantomData
+        from .physics.materials import MATERIALS, XRAY_E_KEV
+
+        meta = self.load_phantom_meta()
+        by_name = {m.name: m for m in MATERIALS.values()}
+        keys = meta.get("material_keys") or [None] * len(meta["materials"])
+        materials = []
+        for key, name in zip(keys, meta["materials"]):
+            mat = MATERIALS.get(key) if key else None
+            mat = mat or by_name.get(name)
+            if mat is None:
+                raise KeyError(
+                    f"Material '{name}' is not in MATERIALS; register it with "
+                    "neutron_xray_sim.register_material() before loading."
+                )
+            materials.append(mat)
+
+        d = self.phantom_dir
+        label_vol = np.load(d / "label_vol.npy")
+        Nz, Nx, Ny = label_vol.shape
+        phantom = PhantomData(Nz=Nz, Nx=Nx, Ny=Ny, voxel_cm=float(meta["voxel_cm"]),
+                              label_vol=label_vol, materials=materials,
+                              name=meta["name"])
+        phantom.mu_n_abs_vol = _load_npy(d / "mu_n_abs_vol.npy")
+        phantom.mu_n_coh_vol = _load_npy(d / "mu_n_coh_vol.npy")
+        phantom.mu_n_inc_vol = _load_npy(d / "mu_n_inc_vol.npy")
+        phantom.mu_n_vol = (phantom.mu_n_abs_vol + phantom.mu_n_coh_vol
+                            + phantom.mu_n_inc_vol)
+        phantom.mu_x_vols = np.stack([
+            _load_npy(d / f"mu_x_vol_{int(round(e)):03d}keV.npy") for e in XRAY_E_KEV
+        ])
+        return phantom
 
     def phantom_exists(self) -> bool:
         """Return True if a phantom has been saved."""
@@ -270,7 +336,8 @@ class SimCache:
     # Raw sinograms (clean, pre-artifact-injection)
     # ─────────────────────────────────────────────────────────────────────────
 
-    def save_raw_sinograms(self, xray_sino: dict, neutron_sino: dict) -> None:
+    def save_raw_sinograms(self, xray_sino: dict, neutron_sino: dict,
+                           params: Optional[dict] = None) -> None:
         """
         Save the clean (pre-artifact) sinogram pair.
 
@@ -288,6 +355,8 @@ class SimCache:
         ----------
         xray_sino    : dict returned by ``project_xray()``
         neutron_sino : dict returned by ``project_neutron()``
+        params       : projection parameters stored alongside, used by
+                       :meth:`raw_sinograms_match` to detect a stale cache
         """
         d = self.sino_dir
 
@@ -317,14 +386,33 @@ class SimCache:
             "I0_xray":          float(xray_sino.get("I0", 1e5)),
             "I0_neutron":       float(neutron_sino.get("I0", 1e5)),
             "voxel_cm":         float(xray_sino.get("voxel_cm", 0.0)),
-            "kVp":              float(xray_sino.get("spectrum", {}).get("kVp", 0.0)
-                                       if isinstance(xray_sino.get("spectrum"), dict)
-                                       else 0.0),
+            "kVp":              float((xray_sino.get("spectrum") or {}).get("kVp", 0.0)),
             "scatter_D_over_L": float(neutron_sino.get("scatter_D_over_L", 100.0)),
             "n_angles":         int(len(xray_sino["angles_deg"])),
             "sino_shape":       list(xray_sino["sino_lam"].shape),
+            "params":           params or {},
         }
         _write_json(d / "sino_meta.json", meta)
+
+    def raw_sinograms_match(self, params: dict) -> bool:
+        """
+        True if the cached raw sinograms were produced with *params*.
+
+        A mismatch (e.g. ``n_angles`` or ``kVp`` changed since the cache was
+        written) triggers a warning; the caller then re-projects.  Caches
+        written before parameters were recorded are assumed to match.
+        """
+        stored = _read_json(self.sino_dir / "sino_meta.json").get("params") or {}
+        diff = {k: (stored[k], v) for k, v in params.items()
+                if k in stored and stored[k] != v}
+        if diff:
+            warnings.warn(
+                f"Cached sinograms in {self.sino_dir} were made with different "
+                f"parameters {diff} (cached, requested); re-projecting.",
+                stacklevel=2,
+            )
+            return False
+        return True
 
     def load_raw_xray_sino(self) -> dict:
         """
@@ -485,7 +573,7 @@ class SimCache:
         -------
         (N, N, N) float32 [cm⁻¹]
         """
-        p = self.run_dir(tag) / f"vol_{modality}.npy"
+        p = self._run_path(tag) / f"vol_{modality}.npy"
         if not p.exists():
             raise FileNotFoundError(f"No saved volume for tag='{tag}', "
                                     f"modality='{modality}' at {p}")
@@ -504,7 +592,7 @@ class SimCache:
         -------
         (n_angles, N, N) float32
         """
-        p = self.run_dir(tag) / f"{modality}_sino_lam.npy"
+        p = self._run_path(tag) / f"{modality}_sino_lam.npy"
         if not p.exists():
             raise FileNotFoundError(f"No sinogram for tag='{tag}', "
                                     f"modality='{modality}' at {p}")
@@ -522,8 +610,8 @@ class SimCache:
         -------
         HistogramResult
         """
-        from .histogram import HistogramResult, compute_bimodal_histogram
-        d = self.run_dir(tag)
+        from .analysis.histogram import HistogramResult
+        d = self._run_path(tag)
         H       = _load_npy(d / "histogram_H.npy")
         x_edges = _load_npy(d / "histogram_x_edges.npy")
         n_edges = _load_npy(d / "histogram_n_edges.npy")
@@ -544,7 +632,7 @@ class SimCache:
 
     def load_run_meta(self, tag: str) -> dict:
         """Return the metadata dict for a run."""
-        return _read_json(self.run_dir(tag) / "run_meta.json")
+        return _read_json(self._run_path(tag) / "run_meta.json")
 
     # ── Survey helpers ────────────────────────────────────────────────────────
 
@@ -631,7 +719,7 @@ class SimCache:
 
     def has_run(self, tag: str) -> bool:
         """Return True if a run with *tag* has been saved."""
-        return (self.run_dir(tag) / "run_meta.json").exists()
+        return (self._run_path(tag) / "run_meta.json").exists()
 
     def clear_run(self, tag: str) -> None:
         """Delete all files for a single run."""
@@ -652,6 +740,15 @@ class SimCache:
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _material_key(material) -> Optional[str]:
+    """Key of *material* in the global MATERIALS database, if registered."""
+    from .physics.materials import MATERIALS
+    for key, m in MATERIALS.items():
+        if m is material:
+            return key
+    return None
+
 
 def _artifact_cfg_to_dict(cfg) -> dict:
     """Convert an ArtifactConfig to a JSON-serialisable dict."""

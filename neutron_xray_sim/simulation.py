@@ -1,7 +1,12 @@
 """
-neutron_xray_sim/simulation.py
-────────────────────────────────
+neutron_xray_sim.simulation
+───────────────────────────
 Top-level orchestrator for dual-modality neutron / X-ray tomography simulation.
+
+Pipeline of one :meth:`DualModalitySimulation.run`::
+
+    phantom ─► projector ─► sinogram artifacts ─► reconstruction
+            ─► volume artifacts ─► bimodal histogram ─► (GMM) ─► signatures
 
 Usage
 -----
@@ -29,7 +34,6 @@ Usage
     result_custom = sim.run(cfg, tag="noise+misalign")
 
     # --- Comparison figure ---
-    from neutron_xray_sim.histogram import plot_comparison_grid
     fig = sim.comparison_grid([result_clean, result_real, result_custom])
     fig.savefig("comparison.png", dpi=150, bbox_inches="tight")
 """
@@ -37,30 +41,36 @@ Usage
 from __future__ import annotations
 
 import time
+import warnings
+
 import numpy as np
 import matplotlib.pyplot as plt
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-from .phantom      import PhantomData, make_phantom
-from .projector    import make_sinogram_pair
-from .artifacts    import ArtifactConfig, inject_sinogram_artifacts, inject_volume_artifacts
-from .reconstructor import reconstruct_pair, AVAILABLE_ALGORITHMS
-from .io           import SimCache, tag_to_slug
-from .histogram    import (
+from .acquisition.artifacts import (
+    ArtifactConfig,
+    inject_sinogram_artifacts,
+    inject_volume_artifacts,
+)
+from .acquisition.projector import make_sinogram_pair
+from .analysis.gmm import GMMFitResult, auto_fit_gmm, fit_gmm
+from .analysis.histogram import (
+    DEFAULT_GT_ENERGY_IDX,
     HistogramResult,
-    GMMFitResult,
     compute_bimodal_histogram,
-    compute_ground_truth_histogram,
-    fit_gmm,
-    auto_fit_gmm,
+)
+from .analysis.quality import ClusterQualityMetrics, evaluate_histogram_quality
+from .analysis.signatures import ArtifactSignatures, detect_artifact_signatures
+from .io import SimCache
+from .phantoms.base import PhantomData
+from .phantoms.presets import make_phantom
+from .plotting.histograms import (
+    plot_artifact_survey,
     plot_bimodal_histogram,
     plot_comparison_grid,
-    detect_artifact_signatures,
-    ArtifactSignatures,
-    evaluate_histogram_quality,
-    ClusterQualityMetrics,
 )
+from .reconstruction.reconstructor import reconstruct_pair
 
 __all__ = ["SimulationResult", "DualModalitySimulation",
            "run_artifact_survey", "ClusterQualityMetrics"]
@@ -104,7 +114,7 @@ class SimulationResult:
     def summary(self) -> str:
         lines = [
             f"═══ SimulationResult: '{self.tag}' ═══",
-            f"  Phantom   : {self.phantom.name}  ({self.phantom.N}³ voxels)",
+            f"  Phantom   : {self.phantom.name}  (shape {self.phantom.shape})",
             f"  Artifacts : {self.cfg.summary()}",
             f"  Vol shape : {self.vol_xray.shape}",
             f"  μ_x range : [{self.vol_xray.min():.3f}, {self.vol_xray.max():.3f}] cm⁻¹",
@@ -117,7 +127,7 @@ class SimulationResult:
         if self.signatures is not None:
             s = self.signatures
             lines += [
-                f"  Signatures:",
+                "  Signatures:",
                 f"    horiz_streak  = {s.horizontal_streak_score:.3f}",
                 f"    vert_streak   = {s.vertical_streak_score:.3f}",
                 f"    diag_smear    = {s.diagonal_smear_score:.3f}",
@@ -259,6 +269,7 @@ class DualModalitySimulation:
         # Load or use supplied phantom
         if phantom is not None:
             self.phantom = phantom
+            self.N = phantom.N
         else:
             if verbose:
                 print(f"[sim] Loading phantom '{preset}' at N={N} …")
@@ -267,20 +278,30 @@ class DualModalitySimulation:
                 print(f"[sim] {self.phantom}")
 
         # Save phantom to cache (first time only)
-        if self.cache is not None and not self.cache.phantom_exists():
-            self.cache.save_phantom(self.phantom)
-            if verbose:
-                print(f"[sim] Phantom saved → {self.cache.phantom_dir}")
+        if self.cache is not None:
+            if not self.cache.phantom_exists():
+                self.cache.save_phantom(self.phantom)
+                if verbose:
+                    print(f"[sim] Phantom saved → {self.cache.phantom_dir}")
+            else:
+                self.cache.check_phantom(self.phantom)
 
         # Cache for raw (clean) sinograms — computed once, reused for all runs.
         # Try to reload from disk first.
         self._raw_xray_sino    = None
         self._raw_neutron_sino = None
         if self.cache is not None and self.cache.raw_sinograms_exist():
-            if verbose:
-                print("[sim] Loading cached raw sinograms …")
-            self._raw_xray_sino    = self.cache.load_raw_xray_sino()
-            self._raw_neutron_sino = self.cache.load_raw_neutron_sino()
+            if self.cache.raw_sinograms_match(self._projection_params()):
+                if verbose:
+                    print("[sim] Loading cached raw sinograms …")
+                self._raw_xray_sino    = self.cache.load_raw_xray_sino()
+                self._raw_neutron_sino = self.cache.load_raw_neutron_sino()
+            elif not self.cache.overwrite:
+                raise ValueError(
+                    f"The sinograms cached in {self.cache.sino_dir} were made "
+                    "with different projection parameters. Pass "
+                    "overwrite_cache=True to replace them, or use another cache_dir."
+                )
 
         # Results store
         self.results: Dict[str, SimulationResult] = {}
@@ -288,6 +309,18 @@ class DualModalitySimulation:
     # ──────────────────────────────────────────────────────────────────────────
     # Internal
     # ──────────────────────────────────────────────────────────────────────────
+
+    def _projection_params(self) -> dict:
+        """Parameters that determine the raw sinograms (used by the cache)."""
+        return {
+            "n_angles":        int(self.n_angles),
+            "angle_range_deg": float(self.angle_range_deg),
+            "kVp":             float(self.kVp),
+            "filter_mm_Al":    float(self.filter_mm_Al),
+            "filter_mm_Cu":    float(self.filter_mm_Cu),
+            "n_spectrum_bins": int(self.n_spectrum_bins),
+            "phantom_shape":   list(self.phantom.shape),
+        }
 
     def _ensure_sinograms(self, I0_xray: float = 1e5, I0_neutron: float = 1e5):
         """Project phantom if not already done (results cached in memory and on disk)."""
@@ -305,11 +338,13 @@ class DualModalitySimulation:
                 I0_xray         = I0_xray,
                 I0_neutron      = I0_neutron,
                 use_astra       = self.use_astra,
+                verbose         = self.verbose,
             )
             # Persist to disk
             if self.cache is not None:
                 self.cache.save_raw_sinograms(
-                    self._raw_xray_sino, self._raw_neutron_sino
+                    self._raw_xray_sino, self._raw_neutron_sino,
+                    params=self._projection_params(),
                 )
                 if self.verbose:
                     print(f"[sim] Raw sinograms saved → {self.cache.sino_dir}")
@@ -320,7 +355,7 @@ class DualModalitySimulation:
 
     def run(
         self,
-        cfg: ArtifactConfig = ArtifactConfig.clean(),
+        cfg: Optional[ArtifactConfig] = None,
         tag: Optional[str] = None,
         rng_seed: int = 0,
         ref_result: Optional[SimulationResult] = None,
@@ -332,6 +367,7 @@ class DualModalitySimulation:
         Parameters
         ----------
         cfg              : ArtifactConfig describing which artifacts to inject
+                           (default: ``ArtifactConfig.clean()``)
         tag              : label for this run (default: cfg.summary())
         rng_seed         : random seed for reproducibility
         ref_result       : reference SimulationResult for shift comparison in
@@ -343,6 +379,8 @@ class DualModalitySimulation:
         -------
         SimulationResult
         """
+        if cfg is None:
+            cfg = ArtifactConfig.clean()
         if tag is None:
             tag = cfg.summary()[:60]
 
@@ -379,6 +417,7 @@ class DualModalitySimulation:
             n_iter       = self.n_iter,
             use_astra    = self.use_astra,
             remove_rings = True,
+            verbose      = self.verbose,
         )
 
         # ── 4. Volume-domain artifacts ────────────────────────────────────────
@@ -404,7 +443,9 @@ class DualModalitySimulation:
             else:
                 n_mat = len(self.phantom.materials)
                 gmm   = auto_fit_gmm(hist, min_k=max(2, n_mat-1),
-                                     max_k=min(self.max_gmm_k, n_mat+2))
+                                     max_k=max(max(2, n_mat-1),
+                                               min(self.max_gmm_k, n_mat+2)),
+                                     verbose=self.verbose)
 
         # ── 7. Artifact signatures ────────────────────────────────────────────
         ref_hist = ref_result.histogram if ref_result is not None else None
@@ -625,8 +666,10 @@ def run_artifact_survey(
 
     Returns
     -------
-    results : dict {tag -> SimulationResult}
-    fig     : matplotlib Figure with all histograms in a grid
+    results        : dict {tag -> SimulationResult}
+    fig            : matplotlib Figure with all histograms in a grid
+    survey_metrics : dict {tag -> ClusterQualityMetrics} (empty if
+                     ``compute_metrics=False``)
     """
 
     # ── Define all single-artifact configurations ─────────────────────────────
@@ -754,77 +797,24 @@ def run_artifact_survey(
             try:
                 survey_metrics[tag] = evaluate_histogram_quality(
                     r.histogram, sim.phantom,
-                    n_components=n_mat, energy_idx=6, exclude_air=True,
+                    n_components=n_mat, energy_idx=DEFAULT_GT_ENERGY_IDX,
+                    exclude_air=True,
                 )
-            except Exception as exc:
-                import warnings
+            except Exception as exc:  # noqa: BLE001 - keep the other runs
                 warnings.warn(f"[survey] metrics failed for '{tag}': {exc}")
         if verbose:
             _print_survey_metrics_table(survey_metrics, algorithm)
 
-    # ── Compute ground-truth histogram ────────────────────────────────────────
-    hist_gt = compute_ground_truth_histogram(sim.phantom, bins=histogram_bins)
-
-    # ── Figure layout ─────────────────────────────────────────────────────────
-    # Row 0: [GT scatter] [clean] [noise moderate] [noise low]
-    # Row 1: [BH no-BHC]  [BH corrected] [n scatter] [x scatter]
-    # Row 2: [PSF]  [rings] [misalign] [noise+misalign]   (if combinations)
-    # Row 3: [scatter+PSF] [noise+BH+rings] [all realistic] (if combinations)
-
-    # Shared axis limits across ALL runs
-    x_max_recon = max(r.histogram.x_edges[-1] for r in results.values())
-    n_max_recon = max(r.histogram.n_edges[-1] for r in results.values())
-    mu_x_gt = np.array([m._mu_x_table[6] for m in sim.phantom.materials])
-    mu_n_gt = np.array([m.mu_n           for m in sim.phantom.materials])
-    x_max = max(x_max_recon, float(mu_x_gt.max()) * 1.08)
-    n_max = max(n_max_recon, float(mu_n_gt.max()) * 1.08)
-    shared_extent = [0.0, x_max, 0.0, n_max]
-
-    # Grid dimensions: GT panel + one per run
-    n_panels = 1 + n_runs
-    ncols    = 4
-    nrows    = int(np.ceil(n_panels / ncols))
-    fw       = figsize_per_panel[0] * ncols
-    fh       = figsize_per_panel[1] * nrows
-
-    fig = plt.figure(figsize=(fw, fh), constrained_layout=True)
-    subtitle = (
-        "White \u25c6 = ground-truth positions"
-        + ("  \u2014  panel subtitle: DB = Davies-Bouldin  CE = mean centroid error [cm\u207b\u00b9]"
+    # ── Figure ────────────────────────────────────────────────────────────────
+    title = (
+        f"Artifact survey \u2014 '{sim.phantom.name}' phantom"
+        f"  (N={sim.N}, {n_angles} angles, {algorithm})\n"
+        "Diamonds = ground-truth positions"
+        + ("  \u2014  DB = Davies-Bouldin, CE = mean centroid error [cm\u207b\u00b9]"
            if compute_metrics else "")
     )
-    _survey_title = (
-        "Artifact survey \u2014 '" + preset + "' phantom"
-        + f"  (N={N}, {n_angles} angles, {algorithm})"
-        + "\n" + subtitle
-    )
-    fig.suptitle(_survey_title, fontsize=10)
-
-    subfigs_flat = fig.subfigures(nrows, ncols, wspace=0.04, hspace=0.06).ravel()
-
-    # Panel 0: ground-truth scatter
-    _draw_gt_scatter_panel(
-        subfigs_flat[0], sim.phantom,
-        title="Ground Truth\n(exact positions)",
-        shared_extent=shared_extent,
-    )
-
-    # Panels 1..n_runs: one histogram per run
-    result_list = list(results.values())
-    for panel_idx, r in enumerate(result_list, start=1):
-        m = survey_metrics.get(r.tag) if compute_metrics else None
-        _draw_survey_histogram_panel(
-            subfigs_flat[panel_idx], r.histogram, r.tag,
-            log_scale=True, cmap=cmap,
-            shared_extent=shared_extent,
-            gt_mu_x=mu_x_gt, gt_mu_n=mu_n_gt,
-            materials=sim.phantom.materials,
-            metrics=m,
-        )
-
-    # Hide any unused subfigure slots
-    for idx in range(n_panels, len(subfigs_flat)):
-        subfigs_flat[idx].set_visible(False)
+    fig = plot_artifact_survey(results, sim.phantom, survey_metrics, title=title,
+                               figsize_per_panel=figsize_per_panel, cmap=cmap)
 
     return results, fig, survey_metrics
 
@@ -844,7 +834,7 @@ def _print_survey_metrics_table(
     col_tag = 34
     sep = "\u2500" * (col_tag + 28)
     print("\n  Cluster quality \u2014 " + algorithm + " survey")
-    print(f"  (ranked by Davies-Bouldin index, lower = better)")
+    print("  (ranked by Davies-Bouldin index, lower = better)")
     print(f"  {sep}")
     _ce_hdr = "Mean CE [cm\u207b\u00b9]"
     _hdr_a = "Artifact scenario"
@@ -859,127 +849,3 @@ def _print_survey_metrics_table(
         clean_tag = tag.replace("\n", " ")
         print(f"  {clean_tag:<{col_tag}}  {db_s}  {ce_s}")
     print("  " + sep + "\n")
-
-
-# ── Panel drawing helpers ──────────────────────────────────────────────────────
-
-def _draw_gt_scatter_panel(
-    subfig: plt.Figure,
-    phantom: "PhantomData",
-    title: str,
-    shared_extent: List[float],
-    energy_idx: int = 6,
-) -> None:
-    """Ground-truth bubble scatter panel (dark background)."""
-    ax = subfig.add_subplot(1, 1, 1)
-    ax.set_facecolor("#0d0d0d")
-    ax.grid(True, color="#2a2a2a", linewidth=0.5, zorder=0)
-
-    materials  = phantom.materials
-    n_mat      = len(materials)
-    mu_x_vals  = np.array([m._mu_x_table[energy_idx] for m in materials])
-    mu_n_vals  = np.array([m.mu_n for m in materials])
-    vox_counts = np.array([(phantom.label_vol == i).sum()
-                            for i in range(n_mat)], dtype=float)
-
-    sqrt_c  = np.sqrt(vox_counts)
-    s_range = sqrt_c.max() - sqrt_c.min() + 1e-9
-    sizes   = 55 + 500 * (sqrt_c - sqrt_c.min()) / s_range
-    colours = plt.cm.Set1(np.linspace(0, 0.9, n_mat))
-
-    x_max = shared_extent[1]
-    n_max = shared_extent[3]
-
-    for i, (m, mx, mn, sz, col) in enumerate(
-            zip(materials, mu_x_vals, mu_n_vals, sizes, colours)):
-        # Cross-hairs
-        ax.axvline(mx, color=col, linewidth=0.5, alpha=0.3, zorder=1)
-        ax.axhline(mn, color=col, linewidth=0.5, alpha=0.3, zorder=1)
-        # Bubble
-        ax.scatter(mx, mn, s=sz, color=col, edgecolors="white",
-                   linewidths=0.7, zorder=3, alpha=0.92)
-        # Label
-        dx = 0.04 * x_max * (1 if mx <= x_max * 0.55 else -1)
-        dy = 0.04 * n_max * (1 if mn <= n_max * 0.55 else -1)
-        ax.annotate(
-            f"{m.symbol}\n({mx:.3f}, {mn:.3f})",
-            xy=(mx, mn), xytext=(mx + dx, mn + dy),
-            fontsize=7, color="white", fontweight="bold",
-            ha="left" if dx > 0 else "right",
-            va="bottom" if dy > 0 else "top",
-            arrowprops=dict(arrowstyle="-", color=col, lw=0.7),
-            zorder=4,
-        )
-
-    ax.set_xlim(shared_extent[0], shared_extent[1])
-    ax.set_ylim(shared_extent[2], shared_extent[3])
-    ax.set_xlabel(r"$\mu_x$ [cm$^{-1}$]", fontsize=9)
-    ax.set_ylabel(r"$\mu_n$ [cm$^{-1}$]", fontsize=9)
-    ax.set_title(title, fontsize=9, color="white", pad=4)
-    ax.tick_params(colors="white", labelsize=7)
-    subfig.set_facecolor("#0d0d0d")
-    for spine in ax.spines.values():
-        spine.set_edgecolor("#444444")
-
-
-def _draw_survey_histogram_panel(
-    subfig: plt.Figure,
-    hist: "HistogramResult",
-    title: str,
-    log_scale: bool,
-    cmap: str,
-    shared_extent: Optional[List[float]],
-    gt_mu_x: Optional[np.ndarray] = None,
-    gt_mu_n: Optional[np.ndarray] = None,
-    materials: Optional[list] = None,
-    metrics: Optional["ClusterQualityMetrics"] = None,
-) -> None:
-    """Single histogram panel for the survey grid (no marginals, compact).
-
-    If *metrics* is supplied, a DB and CE subtitle is appended to the title.
-    """
-    gs      = subfig.add_gridspec(1, 2, width_ratios=[1, 0.06], wspace=0.03)
-    ax_main = subfig.add_subplot(gs[0, 0])
-    ax_cbar = subfig.add_subplot(gs[0, 1])
-
-    extent = shared_extent if shared_extent is not None else hist.extent
-    H      = hist.H.T
-    H_plot = np.log1p(H) if log_scale else H
-    H_plot = np.ma.masked_where(H == 0, H_plot)
-
-    im = ax_main.imshow(
-        H_plot, origin="lower", extent=extent,
-        aspect="auto", cmap=cmap, interpolation="bilinear",
-    )
-    ax_main.set_xlim(extent[0], extent[1])
-    ax_main.set_ylim(extent[2], extent[3])
-    ax_main.set_xlabel(r"$\mu_x$ [cm$^{-1}$]", fontsize=8)
-    ax_main.set_ylabel(r"$\mu_n$ [cm$^{-1}$]", fontsize=8)
-
-    # Build title: tag on line 1, metric subtitle on line 2 if available
-    display_title = title
-    if metrics is not None:
-        db = metrics.davies_bouldin
-        ce = metrics.mean_centroid_error
-        db_s = f"{db:.3f}" if db == db else "n/a"
-        ce_s = f"{ce:.4f}" if ce == ce else "n/a"
-        display_title = title + "\nDB=" + db_s + "  CE=" + ce_s + " cm\u207b\u00b9"
-    ax_main.set_title(display_title, fontsize=8, pad=3, linespacing=1.4)
-    ax_main.tick_params(labelsize=7)
-
-    cbar = plt.colorbar(im, cax=ax_cbar)
-    cbar.ax.tick_params(labelsize=6)
-
-    # GT position markers (white diamonds + material symbol)
-    if gt_mu_x is not None and gt_mu_n is not None:
-        colours = plt.cm.Set1(np.linspace(0, 0.9, len(gt_mu_x)))
-        for i, (mx, mn, col) in enumerate(zip(gt_mu_x, gt_mu_n, colours)):
-            sym = materials[i].symbol if materials is not None else str(i)
-            ax_main.plot(mx, mn, marker="D", color="white",
-                         markersize=4, markeredgecolor=col,
-                         markeredgewidth=1.2, zorder=5)
-            ax_main.annotate(
-                sym, xy=(mx, mn),
-                xytext=(3, 3), textcoords="offset points",
-                fontsize=6, color="white", fontweight="bold", zorder=6,
-            )

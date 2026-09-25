@@ -1,8 +1,11 @@
 # Example scripts
 
-Four runnable scripts under `examples/` reproduce the package's main figures. Each adds
-the repository root to `sys.path` and writes its output files to the working directory.
-Run them from the repo root, e.g. `python examples/01_artifact_comparison.py`.
+Runnable scripts under `examples/` reproduce the package's main figures. They expect the
+package to be installed (`pip install -e .`) and write their output files to the working
+directory, e.g. `python examples/01_artifact_comparison.py`.
+
+For a guided, step-by-step introduction use the [tutorial notebooks](../tutorials/README.md)
+instead; the scripts are compact, non-interactive versions of the same workflows.
 
 ## 01 — Artifact comparison
 
@@ -83,4 +86,13 @@ fig.savefig("...png", dpi=150, bbox_inches="tight")
 To turn them into a study, wrap `sim.run` in a loop over the quantity you care about
 (dose `I0`, `n_angles`, `algorithm`, or beam mode), collect the
 [`ClusterQualityMetrics`](histogram-analysis.md), and plot a metric-versus-parameter
-curve — the `diana_plots` module has ready-made helpers for exactly these curves.
+curve — `neutron_xray_sim.plotting.publication` has ready-made helpers for exactly these curves.
+
+## 05 — Reconstruction sweep
+
+`examples/05_reconstruction_sweep.py`
+
+Reconstructs one battery sinogram pair with FBP, SART, SIRT and CGLS at several iteration
+counts and saves ground-truth-vs-reconstruction histograms and slice comparisons for each
+under `results/figure4/`. It is a publication-scale script (N = 1024, 1200 angles, ASTRA
+required): lower `N` and `N_ANGLES` at the top of the file for a quick test.

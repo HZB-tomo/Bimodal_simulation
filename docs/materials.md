@@ -72,7 +72,7 @@ cross-section over-predicts.
 
 **Formula syntax.** Standard chemical notation with optional decimal subscripts:
 `SiO2`, `KAlSi3O8`, `Fe0.98Ni0.02`, `LiNi0.8Mn0.1Co0.1O2`. Supported elements are
-those present in both `ATOMIC_MASS` / `NEUTRON_XS` and `lib/xray_data/`: H, Li, C, N,
+those present in both `ATOMIC_MASS` / `NEUTRON_XS` (in `physics/elements.py`) and `physics/data/xray/`: H, Li, C, N,
 O, F, Mg, Al, Si, P, S, Cl, K, Ca, Fe, Co, Ni, Mn, In. For minerals with hydroxyl or
 bracketed groups, expand them fully (e.g. hydroxyapatite as `Ca10P6O26H2`, fluorapatite
 as `Ca5P3O12F`, dolomite as `CaMgC2O6`).
@@ -84,7 +84,7 @@ multi-mineral aggregate — use `make_composite_material`. You give it the bulk 
 and a list of `(formula, weight_fraction, end_member_density)` tuples:
 
 ```python
-from neutron_xray_sim.materials import make_composite_material
+from neutron_xray_sim import make_composite_material
 
 bone = make_composite_material(
     name="Fossilised bone", symbol="Bone",
@@ -97,6 +97,10 @@ bone = make_composite_material(
     ],
 )
 ```
+
+> **Needs data files:** this example uses Ca, N and Si, whose NIST XCOM tables are not yet
+> in `neutron_xray_sim/physics/data/xray/`. Until they are added it raises a
+> `FileNotFoundError` naming the missing file (see [Installation](installation.md#the-x-ray-data-files)).
 
 The weight fractions must sum to 1 (within ±0.02; this is asserted). X-ray attenuation
 is the mass-fraction-weighted μ/ρ times bulk density; neutron attenuation treats each

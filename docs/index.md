@@ -1,4 +1,4 @@
-# Documentation — Bimodal_simulation (`neutron_xray_sim`)
+# Documentation — DIANA (`neutron_xray_sim`)
 
 Welcome to the documentation for the dual-modality neutron / X-ray tomography
 simulator. These pages can be read directly on GitHub, served as GitHub Pages, or
@@ -11,7 +11,8 @@ If you are new, read these in order:
 1. [Installation](installation.md) — get the package and its optional GPU backend running.
 2. [Concepts](concepts.md) — the physics of dual-modality imaging and why the bimodal histogram is the central object.
 3. [The simulation pipeline](pipeline.md) — how a phantom becomes a histogram, stage by stage, with the data contracts between stages.
-4. [Example scripts](examples.md) — four runnable scripts that reproduce the main figures.
+4. [Tutorials](../tutorials/README.md) — seven executable notebooks, from first run to artifact studies.
+5. [Example scripts](examples.md) — runnable scripts that reproduce the main figures.
 
 ## Reference pages
 
@@ -24,7 +25,8 @@ If you are new, read these in order:
 | [Histogram analysis](histogram-analysis.md) | The 2-D histogram, GMM fitting, segmentation, quality metrics, and artifact signatures |
 | [Neutron spectra](neutron-spectra.md) | Thermal, cold, and ILL-NeXT beam models, and energy-dependent attenuation |
 | [Importing real data](importing-data.md) | Turning your own segmented volumes into phantoms |
-| [API reference](api-reference.md) | A compact listing of the public functions and classes per module |
+| [API reference](api-reference.md) | A compact listing of the public functions and classes per subpackage |
+| [Contributing](../CONTRIBUTING.md) | Development setup, where code goes, tests and conventions |
 
 ## Conventions used throughout
 
@@ -38,8 +40,8 @@ If you are new, read these in order:
 
 ## A note on `DIANA`
 
-You will see a module named `diana_plots` and reference notes prefixed `DIANA_`.
-*DIANA* is the internal name of the analysis project this simulator grew out of;
-`diana_plots` provides publication-style figures (metric-versus-projection-count
-curves, attenuation spectra, geometry sweeps). It is optional — the analysis API in
-[`histogram.py`](histogram-analysis.md) is self-contained.
+*DIANA* is the name of the project; the Python package is `neutron_xray_sim`.
+`neutron_xray_sim.plotting.publication` (formerly `diana_plots`) provides the paper's
+publication-style figures (metric-versus-projection-count curves, attenuation spectra,
+geometry sweeps). It is optional — the analysis API in
+[`analysis`](histogram-analysis.md) is self-contained.

@@ -1,14 +1,16 @@
-# Bimodal_simulation
+# DIANA
 
 **A simulation toolkit for dual-modality neutron / X-ray tomography and bimodal-histogram analysis.**
 
-Python package import name: `neutron_xray_sim` · Version 1.1.0
+Python package import name: `neutron_xray_sim` · Version 2.0.0 ·
+[Tutorials](tutorials/README.md) · [Documentation](docs/index.md) ·
+[Contributing](CONTRIBUTING.md) · [Changelog](CHANGELOG.md)
 
 ---
 
 ## What this is
 
-`Bimodal_simulation` is an end-to-end simulator for **combined neutron and X-ray
+DIANA is an end-to-end simulator for **combined neutron and X-ray
 computed tomography**. The two modalities are complementary: X-rays are strongly
 attenuated by heavy elements (metals, bone mineral), while thermal neutrons are
 attenuated mainly by light, hydrogen-rich materials (water, polymers, organics).
@@ -61,13 +63,13 @@ chain is wrapped by the `DualModalitySimulation` orchestrator.
 Requires Python ≥ 3.9.
 
 ```bash
-git clone https://github.com/HZB-tomo/Bimodal_simulation.git
-cd Bimodal_simulation
-pip install -r requirements.txt
+git clone https://github.com/OriolSansPlanell/DIANA.git
+cd DIANA
+pip install -e ".[notebooks]"          # add ",dev" if you want to contribute
 ```
 
-The core dependencies (NumPy, SciPy, scikit-image, matplotlib, scikit-learn) are all
-pip-installable and give you the **full pipeline on CPU**.
+The core dependencies (NumPy, SciPy, scikit-image, scikit-learn, matplotlib, pandas) are
+all pip-installable and give you the **full pipeline on CPU**.
 
 For GPU-accelerated projection and iterative reconstruction, install the optional
 **ASTRA Toolbox** (needs a CUDA GPU and conda):
@@ -78,8 +80,8 @@ conda install -c astra-toolbox -c nvidia astra-toolbox
 
 If ASTRA is not present the package automatically falls back to a NumPy/scikit-image
 implementation, and iterative algorithms degrade gracefully to FBP. See
-[`docs/installation.md`](docs/installation.md) for details, including the NIST X-ray
-data files the material database depends on.
+[`docs/installation.md`](docs/installation.md) for details, including the optional extras
+and the NIST X-ray data files the material database depends on.
 
 ---
 
@@ -105,8 +107,17 @@ plt.show()
 volumes, the histogram, an optional GMM fit, and quantitative artifact signatures.
 Call `print(r_real.summary())` for a one-screen overview.
 
-Four runnable example scripts (`01`–`04`) reproduce the main figures; see
-[`docs/examples.md`](docs/examples.md).
+## Learn the software
+
+Start with the **[tutorials](tutorials/README.md)** — seven notebooks that run on a laptop
+CPU in a few minutes each:
+
+1. Getting started · 2. Materials and phantoms · 3. Projection and artifacts ·
+4. Reconstruction · 5. Histogram analysis · 6. Artifact studies and caching ·
+7. Neutron spectra
+
+Then: compact scripts in [`examples/`](docs/examples.md), full research notebooks in
+[`notebooks/`](notebooks/) (these usually need a GPU), and the reference in [`docs/`](docs/index.md).
 
 ---
 
@@ -120,6 +131,7 @@ Four runnable example scripts (`01`–`04`) reproduce the main figures; see
 | `industrial` | Multi-material part with W and Fe inserts | Beam hardening and neutron complementarity in NDE |
 | `jellyroll_battery` | Wound cylindrical cell | Layered electrode structure |
 | `HDPE_composite` | HDPE block with steel rod, Al/Fe cubes, voids | Mixed-density inclusions and air bubbles |
+| `li_ion_spiral` | Spiral-wound Li-ion cell | Archimedean jellyroll with realistic layer thicknesses |
 
 You can also build phantoms primitive-by-primitive with `PhantomBuilder`, or import a
 real segmented volume — see [`docs/phantoms.md`](docs/phantoms.md) and
@@ -152,40 +164,41 @@ Factory presets: `ArtifactConfig.clean()`, `.noise_only()`, `.beam_hardening_onl
 
 ## Repository layout
 
-The repository ships the importable package `neutron_xray_sim` plus example scripts
-and reference notes. The expected structure (mirroring the package's import name) is:
-
 ```
-Bimodal_simulation/
-├── neutron_xray_sim/          # the Python package (import name)
-│   ├── __init__.py            # public API and version
-│   ├── materials.py           # material database, formula + composite builders
-│   ├── phantom.py             # PhantomData, PhantomBuilder, preset phantoms
-│   ├── projector.py           # polychromatic X-ray + thermal neutron projection
-│   ├── artifacts.py           # ArtifactConfig + artifact injection
-│   ├── reconstructor.py       # FBP / SIRT / CGLS / … reconstruction
-│   ├── histogram.py           # bimodal histogram, GMM, segmentation, metrics
-│   ├── simulation.py          # DualModalitySimulation orchestrator
-│   ├── neutron_spectra.py     # thermal / cold / ILL-NeXT neutron beam models
-│   ├── volume_importer.py     # build phantoms from real segmented volumes
-│   ├── metrics_table.py       # tabulated cluster-quality metrics
-│   ├── io.py                  # on-disk SimCache for pipeline stages
-│   ├── diana_plots.py         # publication-figure plotting helpers
-│   └── lib/xray_data/         # NIST XCOM μ/ρ tables (one file per element)
-├── notebooks/
-│   ├── 01_artifact_comparison.py
-│   ├── 02_misalignment_sweep.py
-│   ├── 03_gmm_segmentation.py
-│   └── 04_phantom_showcase.py
-├── docs/                      # the documentation in this folder
-├── requirements.txt
-└── README.md
+DIANA/
+├── neutron_xray_sim/          # the Python package
+│   ├── physics/               # element data, materials, X-ray & neutron spectra, Bragg edges
+│   ├── phantoms/              # PhantomData, PhantomBuilder, presets, segmented-volume import
+│   ├── acquisition/           # projectors, artifacts, noise, cone-beam/laminography geometry
+│   ├── reconstruction/        # FBP / iterative reconstruction, Fourier fusion
+│   ├── analysis/              # histograms, GMM, signatures, quality metrics
+│   ├── plotting/              # histogram figures, publication figure set
+│   ├── simulation.py          # DualModalitySimulation orchestrator, artifact survey
+│   ├── io.py                  # SimCache: on-disk cache of every pipeline stage
+│   └── gui/                   # desktop GUI (diana-gui)
+├── tutorials/                 # step-by-step executable notebooks — start here
+├── examples/                  # non-interactive scripts reproducing the main figures
+├── notebooks/                 # research / paper notebooks (GPU, large N)
+├── tests/                     # pytest suite (run: pytest)
+├── docs/                      # documentation
+├── results/                   # selected published figures
+└── pyproject.toml             # packaging, dependencies, tool config
 ```
 
-> **Note on names.** The GitHub repository is `Bimodal_simulation`; the Python package
-> you import is `neutron_xray_sim`. Keep the package directory named `neutron_xray_sim`
-> so imports resolve. The example scripts add the repo root to `sys.path` before
-> importing.
+Old flat import paths from 1.x (e.g. `neutron_xray_sim.histogram`) still work.
+The GUI starts with `diana-gui` (after `pip install -e ".[gui]"`) or `python launch_gui.py`.
+
+---
+
+## Contributing
+
+Contributions are welcome — new materials, phantoms, artifact models, algorithms, metrics or
+tutorials. See **[CONTRIBUTING.md](CONTRIBUTING.md)** for the development setup, where each
+kind of code belongs, and the test / notebook conventions. In short:
+
+```bash
+pip install -e ".[dev,notebooks]" && pre-commit install && pytest
+```
 
 ---
 
@@ -205,6 +218,7 @@ or pasted into the GitHub wiki:
 - [Histogram analysis](docs/histogram-analysis.md)
 - [Neutron spectra and beam modes](docs/neutron-spectra.md)
 - [Importing real segmented data](docs/importing-data.md)
+- [Tutorials](tutorials/README.md)
 - [Example scripts](docs/examples.md)
 - [API reference](docs/api-reference.md)
 

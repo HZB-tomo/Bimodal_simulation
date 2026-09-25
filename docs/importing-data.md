@@ -31,7 +31,7 @@ object.
 ## The one-call constructor
 
 ```python
-from neutron_xray_sim.volume_importer import phantom_from_segmented_volume
+from neutron_xray_sim import phantom_from_segmented_volume
 
 phantom = phantom_from_segmented_volume(
     "my_segmentation.tif",                  # path, folder, or a NumPy array

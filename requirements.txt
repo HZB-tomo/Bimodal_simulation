@@ -1,18 +1,8 @@
-# neutron_xray_sim — Python dependencies
+# Convenience file: installs DIANA (editable) with the notebook extras.
+# The authoritative dependency list is in pyproject.toml.
 #
-# Install with:  pip install -r requirements.txt
+#   pip install -r requirements.txt
 #
-# ASTRA Toolbox (GPU-accelerated tomographic projection + reconstruction)
-# requires a CUDA-capable GPU and conda:
+# GPU acceleration (optional) needs the ASTRA Toolbox, installed with conda:
 #   conda install -c astra-toolbox -c nvidia astra-toolbox
-#
-# All other packages are pip-installable.
-
-numpy>=1.24
-scipy>=1.10
-scikit-image>=0.21
-matplotlib>=3.7
-scikit-learn>=1.3    # for GMM fitting (optional but recommended)
-
-# Optional: GPU acceleration
-# astra-toolbox          # conda install -c astra-toolbox astra-toolbox
+-e .[notebooks]

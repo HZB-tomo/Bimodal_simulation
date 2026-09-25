@@ -72,7 +72,7 @@ grid, then finalise it into a `PhantomData`. Use it when none of the presets mat
 your geometry but you still want synthetic, exactly-known materials.
 
 ```python
-from neutron_xray_sim.phantom import PhantomBuilder
+from neutron_xray_sim import PhantomBuilder
 from neutron_xray_sim import MATERIALS
 
 builder = PhantomBuilder(Nz=64, Nx=64, Ny=64, voxel_cm=0.02)
@@ -81,7 +81,9 @@ builder = PhantomBuilder(Nz=64, Nx=64, Ny=64, voxel_cm=0.02)
 ```
 
 The exact primitive methods are listed in [the API reference](api-reference.md#phantom);
-the preset factory functions in `phantom.py` are the best worked examples to copy from.
+the preset factory functions in `phantoms/presets.py` are the best worked examples to copy from.
+Register your own factory with `register_preset("name", factory)` so that
+`make_phantom("name", N=...)` and `DualModalitySimulation(preset="name")` can use it.
 
 ## Importing a real segmented volume
 

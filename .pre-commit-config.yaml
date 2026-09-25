@@ -1,0 +1,21 @@
+# Install once with:  pip install pre-commit && pre-commit install
+repos:
+  - repo: https://github.com/kynan/nbstripout
+    rev: 0.7.1
+    hooks:
+      - id: nbstripout          # never commit notebook outputs
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      - id: ruff
+        args: [--fix]
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: check-added-large-files
+        args: [--maxkb=2000]
+      - id: check-merge-conflict
+      - id: end-of-file-fixer
+        exclude: \.(txt|svg)$
+      - id: trailing-whitespace
+        exclude: \.(txt|svg)$

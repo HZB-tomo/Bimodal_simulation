@@ -3,22 +3,157 @@ neutron_xray_sim/phantom.py
 ────────────────────────────
 Voxelised 3-D phantom builder.
 
-A Phantom stores a label volume (integer material indices) plus the
-corresponding pair of attenuation-coefficient arrays (one for neutrons,
-one per energy bin for X-rays).  The helper methods add geometric
-primitives, and several preset phantoms are provided.
+A phantom stores a label volume (integer material indices) plus the material
+list it indexes into.  Everything else — the neutron attenuation volumes and
+the per-energy X-ray volumes — is *derived* from those two, and is built lazily
+on first access (see :class:`PhantomData`).
+
+Adding a preset
+───────────────
+Decorate a factory with :func:`register_phantom` and it becomes available
+through :func:`make_phantom`, the GUI, and every example script::
+
+    @register_phantom("my_sample", description="Two-phase sintered pellet")
+    def make_my_sample_phantom(N=64, voxel_cm=None, Nx=None, Ny=None, Nz=None):
+        Nx, Ny, Nz, voxel_cm = resolve_grid(N, Nx, Ny, Nz, voxel_cm, extent_cm=1.0)
+        b = PhantomBuilder(Nx=Nx, Ny=Ny, Nz=Nz, voxel_cm=voxel_cm)
+        ...
+        return b.build("my_sample")
+
+Every preset takes the same five keyword arguments, so ``make_phantom`` can
+call any of them the same way.  :func:`resolve_grid` implements the shared
+"either N, or all of Nx/Ny/Nz" rule that used to be copy-pasted into each
+factory.
 """
 
 from __future__ import annotations
-import numpy as np
+
+import inspect
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from math import ceil
+from typing import Callable, Dict, List, Optional, Tuple
 
-from math import ceil, pi
+import numpy as np
+
+from .materials import MATERIALS, XRAY_E_KEV, Material
+
+__all__ = [
+    "PhantomData", "PhantomBuilder", "make_phantom", "resolve_grid",
+    "register_phantom", "PHANTOM_PRESETS", "PHANTOM_DESCRIPTIONS",
+    "make_composite_phantom", "make_battery_phantom",
+    "make_bone_implant_phantom", "make_industrial_phantom",
+    "make_hdpe_composite_phantom", "make_custom_cylindrical_battery_phantom",
+    "make_li_ion_battery_phantom",
+]
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Preset registry
+# ──────────────────────────────────────────────────────────────────────────────
 
-from .materials import Material, MATERIALS, XRAY_E_KEV, xray_spectrum
+#: ``preset name → factory``. Populated by :func:`register_phantom`; never edit
+#: it directly, so that the signature check stays enforced.
+PHANTOM_PRESETS: Dict[str, Callable[..., PhantomData]] = {}
+
+#: ``preset name → one-line description``, for menus, docs, and the GUI.
+PHANTOM_DESCRIPTIONS: Dict[str, str] = {}
+
+#: Every preset factory must accept exactly these keyword arguments so that
+#: :func:`make_phantom` can call any of them identically.
+_PRESET_SIGNATURE = ("N", "voxel_cm", "Nx", "Ny", "Nz")
+
+
+def register_phantom(name: str, *, description: str = ""):
+    """Register a phantom factory under *name*.
+
+    The factory must accept the five standard keyword arguments
+    ``N, voxel_cm, Nx, Ny, Nz`` — extra keyword arguments with defaults are
+    fine.  The check happens at import time, so a preset that ``make_phantom``
+    could not call fails loudly during development rather than silently at the
+    bottom of someone's sweep.
+
+    Raises
+    ------
+    ValueError
+        If *name* is already registered, or the signature is incompatible.
+    """
+    def decorator(func: Callable[..., PhantomData]):
+        if name in PHANTOM_PRESETS:
+            raise ValueError(
+                f"Phantom preset {name!r} is already registered by "
+                f"{PHANTOM_PRESETS[name].__module__}.{PHANTOM_PRESETS[name].__name__}."
+            )
+        params = inspect.signature(func).parameters
+        missing = [p for p in _PRESET_SIGNATURE if p not in params]
+        if missing:
+            raise ValueError(
+                f"Phantom preset {name!r} ({func.__name__}) is missing required "
+                f"keyword argument(s) {missing}. Every preset must accept "
+                f"{list(_PRESET_SIGNATURE)} so make_phantom() can call it."
+            )
+        PHANTOM_PRESETS[name] = func
+        PHANTOM_DESCRIPTIONS[name] = description or (func.__doc__ or "").strip().split("\n")[0]
+        return func
+    return decorator
+
+
+def resolve_grid(
+    N: Optional[int] = 64,
+    Nx: Optional[int] = None,
+    Ny: Optional[int] = None,
+    Nz: Optional[int] = None,
+    voxel_cm: Optional[float] = None,
+    *,
+    extent_cm: float = 1.0,
+) -> Tuple[int, int, int, float]:
+    """Resolve the "either N, or all of Nx/Ny/Nz" convention into a grid.
+
+    Every preset factory starts by calling this, which is why they all accept
+    the same arguments and reject the same mistakes.  Previously each factory
+    carried its own copy of the logic, and they had drifted apart.
+
+    Parameters
+    ----------
+    N
+        Cubic grid size. Used when *Nx*, *Ny*, *Nz* are all omitted.
+    Nx, Ny, Nz
+        Non-cubic grid. All three must be given together.
+    voxel_cm
+        Voxel side length [cm]. When ``None``, it is chosen so the phantom's
+        largest side spans *extent_cm*.
+    extent_cm
+        Physical size of the largest side [cm] used for the automatic voxel
+        size — 1.0 for most samples, 1.4 for the AAA-cell battery.
+
+    Returns
+    -------
+    (Nx, Ny, Nz, voxel_cm)
+    """
+    given = [v for v in (Nx, Ny, Nz) if v is not None]
+    if given:
+        if len(given) != 3:
+            raise ValueError(
+                "Provide either N alone, or all three of Nx, Ny and Nz "
+                f"(got Nx={Nx!r}, Ny={Ny!r}, Nz={Nz!r})."
+            )
+        Nx, Ny, Nz = int(Nx), int(Ny), int(Nz)
+    else:
+        if N is None:
+            raise ValueError("Provide either N, or all three of Nx, Ny and Nz.")
+        Nx = Ny = Nz = int(N)
+
+    if min(Nx, Ny, Nz) <= 0:
+        raise ValueError(
+            f"Grid dimensions must be positive, got Nx={Nx}, Ny={Ny}, Nz={Nz}."
+        )
+
+    if voxel_cm is None:
+        voxel_cm = extent_cm / max(Nx, Ny, Nz)
+    voxel_cm = float(voxel_cm)
+    if voxel_cm <= 0:
+        raise ValueError(f"voxel_cm must be positive, got {voxel_cm}.")
+
+    return Nx, Ny, Nz, voxel_cm
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -54,16 +189,20 @@ class PhantomData:
     materials: List[Material]
     name: str = "phantom"
 
-    # Derived attenuation volumes (filled lazily)
+    # Derived attenuation volumes. These are *outputs*, not inputs: they are
+    # computed from label_vol + materials on first access and cached here.
+    # Passing them to the constructor is supported (NCrystal overrides the
+    # neutron channel that way) but is not the normal path.
     mu_n_vol: Optional[np.ndarray] = field(default=None, repr=False)
     mu_n_abs_vol: Optional[np.ndarray] = field(default=None, repr=False)
     mu_n_coh_vol: Optional[np.ndarray] = field(default=None, repr=False)
     mu_n_inc_vol: Optional[np.ndarray] = field(default=None, repr=False)
-    mu_x_vols: Optional[np.ndarray] = field(default=None, repr=False)
 
     def __post_init__(self):
         self._validate_shape()
-        self._build_mu_vols()
+        self._mu_x_cache: Optional[np.ndarray] = None
+        if self.mu_n_vol is None:
+            self._build_neutron_vols()
 
     # ── Backward-compatible aliases ──────────────────────────────────────────
 
@@ -102,49 +241,78 @@ class PhantomData:
                 f"got {self.label_vol.shape}"
             )
 
-    def _build_mu_vols(self):
-        """Build attenuation-coefficient arrays from label_vol + materials."""
-        n_E = len(XRAY_E_KEV)
-        shape = (self.Nz, self.Nx, self.Ny)
+    def _build_neutron_vols(self):
+        """Fill the four neutron attenuation volumes from labels + materials.
 
-        mu_n = np.zeros(shape, dtype=np.float32)
-        mu_n_abs = np.zeros_like(mu_n)
-        mu_n_coh = np.zeros_like(mu_n)
-        mu_n_inc = np.zeros_like(mu_n)
-        mu_x = np.zeros((n_E, *shape), dtype=np.float32)
+        A single pass over the label volume builds a per-material lookup table
+        and indexes with it, which is both faster and clearer than one boolean
+        mask per material per array.
+        """
+        labels = self.label_vol
+        n_mat = len(self.materials)
 
+        lut = np.zeros((4, max(n_mat, int(labels.max()) + 1)), dtype=np.float32)
         for idx, mat in enumerate(self.materials):
-            mask = self.label_vol == idx
-            if not mask.any():
-                continue
+            lut[:, idx] = (mat.mu_n, mat.mu_n_abs, mat.mu_n_coh, mat.mu_n_inc)
 
-            mu_n[mask] = mat.mu_n
-            mu_n_abs[mask] = mat.mu_n_abs
-            mu_n_coh[mask] = mat.mu_n_coh
-            mu_n_inc[mask] = mat.mu_n_inc
+        self.mu_n_vol = lut[0][labels]
+        self.mu_n_abs_vol = lut[1][labels]
+        self.mu_n_coh_vol = lut[2][labels]
+        self.mu_n_inc_vol = lut[3][labels]
 
-            for e, _ in enumerate(XRAY_E_KEV):
-                mu_x[e][mask] = mat._mu_x_table[e]
+    # ── Derived X-ray volumes (lazy) ─────────────────────────────────────────
 
-        self.mu_n_vol = mu_n
-        self.mu_n_abs_vol = mu_n_abs
-        self.mu_n_coh_vol = mu_n_coh
-        self.mu_n_inc_vol = mu_n_inc
-        self.mu_x_vols = mu_x
+    @property
+    def mu_x_vols(self) -> np.ndarray:
+        """X-ray attenuation at every ``XRAY_E_KEV`` energy, ``(13, Nz, Nx, Ny)``.
+
+        Built on first access and cached.  Note the size: this array is 13×
+        the label volume in float32, so a 512³ phantom needs ~7 GB.  Prefer
+        :meth:`mu_x_at_index` or :meth:`mu_x_at_energy`, which materialise one
+        energy at a time — the projector and histogram code both do.
+        """
+        if self._mu_x_cache is None:
+            self._mu_x_cache = np.stack(
+                [self.mu_x_at_index(e) for e in range(len(XRAY_E_KEV))]
+            )
+        return self._mu_x_cache
+
+    @mu_x_vols.setter
+    def mu_x_vols(self, value: Optional[np.ndarray]) -> None:
+        self._mu_x_cache = value
+
+    def _map_over_labels(self, values: np.ndarray) -> np.ndarray:
+        """Expand a per-material value array into a full volume."""
+        lut = np.zeros(max(len(self.materials), int(self.label_vol.max()) + 1),
+                       dtype=np.float32)
+        lut[:len(values)] = values
+        return lut[self.label_vol]
+
+    def mu_x_at_index(self, energy_idx: int) -> np.ndarray:
+        """X-ray attenuation volume at ``XRAY_E_KEV[energy_idx]`` [cm⁻¹]."""
+        if not 0 <= energy_idx < len(XRAY_E_KEV):
+            raise IndexError(
+                f"energy_idx {energy_idx} is out of range for the "
+                f"{len(XRAY_E_KEV)}-point grid {list(XRAY_E_KEV)}."
+            )
+        return self._map_over_labels(
+            np.array([m.mu_x_table[energy_idx] for m in self.materials], dtype=np.float32)
+        )
+
+    def mu_x_at_energy(self, energy_keV: float) -> np.ndarray:
+        """X-ray attenuation volume interpolated at an arbitrary energy [cm⁻¹]."""
+        return self._map_over_labels(
+            np.array([m.mu_x_at(energy_keV) for m in self.materials], dtype=np.float32)
+        )
 
     # ── Public helpers ────────────────────────────────────────────────────────
 
     def material_name(self, label: int) -> str:
         return self.materials[label].name if label < len(self.materials) else "unknown"
 
-    def mu_x_at_energy(self, energy_keV: float) -> np.ndarray:
-        """Interpolate X-ray attenuation volume at arbitrary energy [cm⁻¹]."""
-        result = np.zeros((self.Nz, self.Nx, self.Ny), dtype=np.float32)
-        for idx, mat in enumerate(self.materials):
-            mask = self.label_vol == idx
-            if mask.any():
-                result[mask] = mat.mu_x_at(energy_keV)
-        return result
+    def voxel_counts(self) -> np.ndarray:
+        """Number of voxels assigned to each material, indexed like `materials`."""
+        return np.bincount(self.label_vol.ravel(), minlength=len(self.materials))
 
     def __repr__(self):
         mats = ", ".join(m.symbol for m in self.materials)
@@ -226,6 +394,7 @@ class PhantomBuilder:
 
         self._label_vol = np.zeros((self.Nz, self.Nx, self.Ny), dtype=np.uint8)
         self._materials: List[Material] = [MATERIALS["air"]]  # index 0 = air
+        self._material_index: Dict[int, int] = {id(self._materials[0]): 0}
 
         # Coordinate arrays for geometry tests (physical coords, cm).
         # Storage convention: axis 0 = z, axis 1 = x, axis 2 = y.
@@ -252,11 +421,35 @@ class PhantomBuilder:
     # ── Material registry ─────────────────────────────────────────────────────
 
     def _mat_index(self, material) -> int:
+        """Return the label index for *material*, appending it if new.
+
+        Indexed by ``id()`` rather than by value: ``Material`` holds a NumPy
+        array, so the old ``material in self._materials`` scan compared arrays
+        elementwise and raised "truth value of an array is ambiguous" whenever
+        two materials shared a name.  Identity is also the right semantics —
+        two distinct ``Material`` objects are two phases even if their numbers
+        happen to coincide.
+        """
         if isinstance(material, str):
-            material = MATERIALS[material]
-        if material not in self._materials:
+            try:
+                material = MATERIALS[material]
+            except KeyError as exc:
+                raise KeyError(
+                    f"Unknown material {material!r}. "
+                    f"Available: {', '.join(sorted(MATERIALS))}. "
+                    "Register new materials with MATERIALS.register(...)."
+                ) from exc
+
+        key = id(material)
+        if key not in self._material_index:
+            self._material_index[key] = len(self._materials)
             self._materials.append(material)
-        return self._materials.index(material)
+            if len(self._materials) > 255:
+                raise ValueError(
+                    "A phantom may hold at most 255 materials plus air, because "
+                    "the label volume is uint8."
+                )
+        return self._material_index[key]
 
     # ── Primitive operations ──────────────────────────────────────────────────
 
@@ -492,6 +685,7 @@ class PhantomBuilder:
         )
 
 
+@register_phantom("composite", description="HDPE matrix with water / Fe / Ti inclusions (~1 cm)")
 def make_composite_phantom(
     N: Optional[int] = 64,
     voxel_cm: Optional[float] = None,
@@ -528,29 +722,15 @@ def make_composite_phantom(
       Fe   : OD_n = 1.16  T_n = 0.31   OD_x(80) = 4.12  T_x = 0.016
       Al   : OD_n = 0.10  T_n = 0.91   OD_x(80) = 0.28  T_x = 0.76
     """
-    if any(v is not None for v in (Nx, Ny, Nz)):
-        if not all(v is not None for v in (Nx, Ny, Nz)):
-            raise ValueError("Provide either N only, or all of Nx, Ny, and Nz.")
-        dims = (int(Nx), int(Ny), int(Nz))
-    else:
-        if N is None:
-            raise ValueError("Provide either N or all of Nx, Ny, and Nz.")
-        dims = (int(N), int(N), int(N))
-        Nx = Ny = Nz = int(N)
-
-    if voxel_cm is None:
-        # Preserve old behavior for cubic phantoms: total side length = 1 cm.
-        # For non-cubic phantoms, use the largest dimension so the largest side
-        # is approximately 1 cm and geometry remains inside the volume.
-        voxel_cm = 1.0 / max(dims)
-
-    b = PhantomBuilder(N=None, Nx=Nx, Ny=Ny, Nz=Nz, voxel_cm=voxel_cm)
+    Nx, Ny, Nz, voxel_cm = resolve_grid(
+        N, Nx, Ny, Nz, voxel_cm, extent_cm=1.0
+    )
+    b = PhantomBuilder(Nx=Nx, Ny=Ny, Nz=Nz, voxel_cm=voxel_cm)
 
     # Use the smallest half-width so the circular cross-section fits inside
     # non-cubic x/y dimensions. The cylinder axis is now z by default.
     Lx = b.Nx * b.voxel_cm / 2
     Ly = b.Ny * b.voxel_cm / 2
-    Lz = b.Nz * b.voxel_cm / 2
     L = min(Lx, Ly)
 
     r_outer = 0.82 * L
@@ -584,6 +764,7 @@ def make_composite_phantom(
 
 
 
+@register_phantom("battery", description="Alkaline AAA cell cross-section (~1.4 cm)")
 def make_battery_phantom(
     N: Optional[int] = 64,
     voxel_cm: Optional[float] = None,
@@ -608,21 +789,10 @@ def make_battery_phantom(
 
     After LaManna et al. (NIST NeXT simultaneous neutron + X-ray).
     """
-    if any(v is not None for v in (Nx, Ny, Nz)):
-        if not all(v is not None for v in (Nx, Ny, Nz)):
-            raise ValueError("Provide either N only, or all of Nx, Ny, and Nz.")
-        dims = (int(Nx), int(Ny), int(Nz))
-    else:
-        if N is None:
-            raise ValueError("Provide either N or all of Nx, Ny, and Nz.")
-        Nx = Ny = Nz = int(N)
-        dims = (Nx, Ny, Nz)
-
-    if voxel_cm is None:
-        # Preserve old cubic behavior: largest transverse side is 1.4 cm.
-        voxel_cm = 1.4 / max(dims)
-
-    b = PhantomBuilder(N=None, Nx=Nx, Ny=Ny, Nz=Nz, voxel_cm=voxel_cm)
+    Nx, Ny, Nz, voxel_cm = resolve_grid(
+        N, Nx, Ny, Nz, voxel_cm, extent_cm=1.4
+    )
+    b = PhantomBuilder(Nx=Nx, Ny=Ny, Nz=Nz, voxel_cm=voxel_cm)
 
     # Circular cross-section lies in the x-y plane; cylinder axis is z.
     Lx = b.Nx * b.voxel_cm / 2
@@ -661,6 +831,7 @@ def make_battery_phantom(
 
 
 
+@register_phantom("bone_implant", description="Cortical bone with a titanium screw (~1 cm)")
 def make_bone_implant_phantom(
     N: Optional[int] = 64,
     voxel_cm: Optional[float] = None,
@@ -683,28 +854,15 @@ def make_bone_implant_phantom(
     Demonstrates that neutrons resolve the bone–metal interface where X-rays
     suffer photon starvation next to the Ti implant.
     """
-    if any(v is not None for v in (Nx, Ny, Nz)):
-        if not all(v is not None for v in (Nx, Ny, Nz)):
-            raise ValueError("Provide either N only, or all of Nx, Ny, and Nz.")
-        dims = (int(Nx), int(Ny), int(Nz))
-    else:
-        if N is None:
-            raise ValueError("Provide either N or all of Nx, Ny, and Nz.")
-        Nx = Ny = Nz = int(N)
-        dims = (Nx, Ny, Nz)
-
-    if voxel_cm is None:
-        # Preserve old cubic behavior: largest side is 1.0 cm.
-        voxel_cm = 1.0 / max(dims)
-
-    b = PhantomBuilder(N=None, Nx=Nx, Ny=Ny, Nz=Nz, voxel_cm=voxel_cm)
+    Nx, Ny, Nz, voxel_cm = resolve_grid(
+        N, Nx, Ny, Nz, voxel_cm, extent_cm=1.0
+    )
+    b = PhantomBuilder(Nx=Nx, Ny=Ny, Nz=Nz, voxel_cm=voxel_cm)
 
     # Main sample cross-section lies in x-y; cylinder axis is z.
     Lx = b.Nx * b.voxel_cm / 2
     Ly = b.Ny * b.voxel_cm / 2
     L = min(Lx, Ly)
-
-    wall = max(2 * voxel_cm, 0.02 * L)
 
     # Cortical bone outer shell
     b.add_hollow_cylinder(
@@ -739,6 +897,7 @@ def make_bone_implant_phantom(
 
 
 
+@register_phantom("industrial", description="Multi-material NDE part with W and Fe inserts (~1 cm)")
 def make_industrial_phantom(
     N: Optional[int] = 64,
     voxel_cm: Optional[float] = None,
@@ -762,21 +921,10 @@ def make_industrial_phantom(
     W screws: μ_x(80keV)=88 cm⁻¹ → photon starvation even at ~0.5mm.
     W screws: μ_n=1.56 cm⁻¹ → well-resolved by neutrons.
     """
-    if any(v is not None for v in (Nx, Ny, Nz)):
-        if not all(v is not None for v in (Nx, Ny, Nz)):
-            raise ValueError("Provide either N only, or all of Nx, Ny, and Nz.")
-        dims = (int(Nx), int(Ny), int(Nz))
-    else:
-        if N is None:
-            raise ValueError("Provide either N or all of Nx, Ny, and Nz.")
-        Nx = Ny = Nz = int(N)
-        dims = (Nx, Ny, Nz)
-
-    if voxel_cm is None:
-        # Preserve old cubic behavior: largest side is 1.0 cm.
-        voxel_cm = 1.0 / max(dims)
-
-    b = PhantomBuilder(N=None, Nx=Nx, Ny=Ny, Nz=Nz, voxel_cm=voxel_cm)
+    Nx, Ny, Nz, voxel_cm = resolve_grid(
+        N, Nx, Ny, Nz, voxel_cm, extent_cm=1.0
+    )
+    b = PhantomBuilder(Nx=Nx, Ny=Ny, Nz=Nz, voxel_cm=voxel_cm)
 
     # Circular cross-section lies in x-y; cylinder axis is z.
     Lx = b.Nx * b.voxel_cm / 2
@@ -826,6 +974,7 @@ def make_industrial_phantom(
 
     return b.build("industrial")
 
+@register_phantom("HDPE_composite", description="HDPE block with steel rod, Al/Fe cubes and voids")
 def make_hdpe_composite_phantom(
     N: Optional[int] = 64,
     voxel_cm: Optional[float] = None,
@@ -848,21 +997,10 @@ def make_hdpe_composite_phantom(
     Coordinates are (z, x, y).
     """
 
-    if any(v is not None for v in (Nx, Ny, Nz)):
-        if not all(v is not None for v in (Nx, Ny, Nz)):
-            raise ValueError("Provide either N only, or all of Nx, Ny, and Nz.")
-        Nx, Ny, Nz = int(Nx), int(Ny), int(Nz)
-        dims = (Nx, Ny, Nz)
-    else:
-        if N is None:
-            raise ValueError("Provide either N or all of Nx, Ny, and Nz.")
-        Nx = Ny = Nz = int(N)
-        dims = (Nx, Ny, Nz)
-
-    if voxel_cm is None:
-        voxel_cm = 1.0 / max(dims)
-
-    b = PhantomBuilder(N=None, Nx=Nx, Ny=Ny, Nz=Nz, voxel_cm=voxel_cm)
+    Nx, Ny, Nz, voxel_cm = resolve_grid(
+        N, Nx, Ny, Nz, voxel_cm, extent_cm=1.0
+    )
+    b = PhantomBuilder(Nx=Nx, Ny=Ny, Nz=Nz, voxel_cm=voxel_cm)
 
     Lx = b.Nx * b.voxel_cm / 2
     Ly = b.Ny * b.voxel_cm / 2
@@ -955,10 +1093,16 @@ def make_hdpe_composite_phantom(
 
 
 
+@register_phantom("spiral_battery", description="Cylindrical Li-ion cell with an Archimedean-spiral jellyroll")
 def make_li_ion_battery_phantom(
+    N: Optional[int] = 512,
+    voxel_cm: Optional[float] = None,
+    Nx: Optional[int] = None,
+    Ny: Optional[int] = None,
+    Nz: Optional[int] = None,
+    *,
     diameter_cm: float = 1.0,
     length_cm: float = 2.0,
-    N: int = 512,
     cathode_material: str = "nmc811",
     can_material: str = "steel",
     separator_material: str = "separator_pe_electrolyte",
@@ -1018,7 +1162,7 @@ def make_li_ion_battery_phantom(
     jellyroll_inner_radius = rod_outer_radius + jellyroll_inner_gap
     jellyroll_outer_radius = inner_can_radius - 0.02  # small clearance
     # Jellyroll starts exactly where rod starts
-    jellyroll_z_min = rod_bottom_z 
+    jellyroll_z_min = rod_bottom_z
 
     # It fills upward but still respects top clearance
     jellyroll_z_max = min(
@@ -1044,11 +1188,20 @@ def make_li_ion_battery_phantom(
     # -------------------------
     # Grid
     # -------------------------
-    voxel_cm = diameter_cm / N
-    Nx = Ny = int(N)
-    Nz = int(ceil(length_cm / voxel_cm))
+    # The cell is not cubic: N sets the transverse sampling across the
+    # diameter, and the axial extent follows from length_cm.
+    if Nx is None and Ny is None and Nz is None:
+        if voxel_cm is None:
+            if not N:
+                raise ValueError("Provide N, voxel_cm, or all of Nx, Ny and Nz.")
+            voxel_cm = diameter_cm / int(N)
+        Nx = Ny = int(round(diameter_cm / voxel_cm))
+        Nz = int(ceil(length_cm / voxel_cm))
 
-    b = PhantomBuilder(N=None, Nx=Nx, Ny=Ny, Nz=Nz, voxel_cm=voxel_cm)
+    Nx, Ny, Nz, voxel_cm = resolve_grid(
+        None, Nx, Ny, Nz, voxel_cm, extent_cm=max(diameter_cm, length_cm)
+    )
+    b = PhantomBuilder(Nx=Nx, Ny=Ny, Nz=Nz, voxel_cm=voxel_cm)
 
     # -------------------------
     # Can wall and end disks
@@ -1147,11 +1300,15 @@ def make_li_ion_battery_phantom(
     return phantom
 
 
+@register_phantom("jellyroll_battery", description="Parameterised cylindrical Li-ion cell with concentric jellyroll turns")
 def make_custom_cylindrical_battery_phantom(
-    N: int = 256,
-    length_cm: float = 2.0,
+    N: Optional[int] = 256,
     voxel_cm: Optional[float] = None,
+    Nx: Optional[int] = None,
+    Ny: Optional[int] = None,
+    Nz: Optional[int] = None,
     *,
+    length_cm: float = 2.0,
     diameter_cm: float = 1.0,
     n_jellyroll_turns: int = 2,
 
@@ -1227,19 +1384,20 @@ def make_custom_cylindrical_battery_phantom(
             + f". Available materials: {list(MATERIALS.keys())}"
         )
 
-    if voxel_cm is None:
-        voxel_cm = diameter_cm / N
+    # As for the spiral cell: N samples the diameter, the axial extent follows
+    # from length_cm, so the grid is deliberately non-cubic.
+    if Nx is None and Ny is None and Nz is None:
+        if voxel_cm is None:
+            if not N:
+                raise ValueError("Provide N, voxel_cm, or all of Nx, Ny and Nz.")
+            voxel_cm = diameter_cm / int(N)
+        Nx = Ny = int(round(diameter_cm / voxel_cm))
+        Nz = int(ceil(length_cm / voxel_cm))
 
-    Nx = N
-    Ny = N
-    Nz = int(np.ceil(length_cm / voxel_cm))
-
-    b = PhantomBuilder(
-        Nx=Nx,
-        Ny=Ny,
-        Nz=Nz,
-        voxel_cm=voxel_cm,
+    Nx, Ny, Nz, voxel_cm = resolve_grid(
+        None, Nx, Ny, Nz, voxel_cm, extent_cm=max(diameter_cm, length_cm)
     )
+    b = PhantomBuilder(Nx=Nx, Ny=Ny, Nz=Nz, voxel_cm=voxel_cm)
 
     cz0, cx0, cy0 = center_cm
 
@@ -1358,19 +1516,7 @@ def make_custom_cylindrical_battery_phantom(
 
 
 
-# ── Registry ──────────────────────────────────────────────────────────────────
-
-PHANTOM_PRESETS: Dict[str, callable] = {
-    "composite":     make_composite_phantom,
-    "battery":       make_battery_phantom,
-    "bone_implant":  make_bone_implant_phantom,
-    "industrial":    make_industrial_phantom,
-    "jellyroll_battery" : make_custom_cylindrical_battery_phantom,
-    'HDPE_composite' : make_hdpe_composite_phantom
-    
-
-
-}
+# ── Preset dispatch ───────────────────────────────────────────────────────────
 
 def make_phantom(
     preset: str = "composite",
@@ -1379,46 +1525,41 @@ def make_phantom(
     Ny: Optional[int] = None,
     Nz: Optional[int] = None,
     voxel_cm: Optional[float] = None,
+    **preset_kwargs,
 ) -> PhantomData:
     """
-    Load a named preset phantom.
+    Build a registered preset phantom.
 
-    Backward-compatible cubic use:
+    Cubic::
+
         make_phantom("composite", N=64)
 
-    Non-cubic use:
+    Non-cubic::
+
         make_phantom("composite", Nx=96, Ny=64, Nz=128)
 
-    Storage convention is (Nz, Nx, Ny), with coordinates ordered as (z, x, y).
+    Preset-specific options pass straight through::
 
-    Sample sizes are physically realistic for neutron tomography:
-      composite / bone_implant / industrial  →  1.0 cm diameter
-      battery                                →  1.4 cm diameter (AAA cell)
+        make_phantom("jellyroll_battery", N=256, n_jellyroll_turns=3)
 
-    Voxel size scales automatically with N or max(Nx, Ny, Nz) so geometry is
-    preserved unless voxel_cm is explicitly supplied.
+    Storage convention is ``(Nz, Nx, Ny)``, with coordinates ordered ``(z, x, y)``.
+    Voxel size scales with ``N`` (or ``max(Nx, Ny, Nz)``) so the physical sample
+    size stays fixed unless *voxel_cm* is given explicitly.
+
+    Every preset accepts the same five grid arguments — enforced by
+    :func:`register_phantom` — so a preset that works here works everywhere.
+
+    See Also
+    --------
+    PHANTOM_PRESETS, PHANTOM_DESCRIPTIONS, register_phantom
     """
     if preset not in PHANTOM_PRESETS:
-        raise ValueError(
-            f"Unknown preset '{preset}'. Choose from: {list(PHANTOM_PRESETS)}"
+        available = "\n".join(
+            f"    {name:<20} {PHANTOM_DESCRIPTIONS.get(name, '')}"
+            for name in sorted(PHANTOM_PRESETS)
         )
-
-    if any(v is not None for v in (Nx, Ny, Nz)):
-        if not all(v is not None for v in (Nx, Ny, Nz)):
-            raise ValueError("Provide either N only, or all of Nx, Ny, and Nz.")
-
-        return PHANTOM_PRESETS[preset](
-            N=None,
-            Nx=Nx,
-            Ny=Ny,
-            Nz=Nz,
-            voxel_cm=voxel_cm,
-        )
-
-    if N is None:
-        raise ValueError("Provide either N or all of Nx, Ny, and Nz.")
+        raise ValueError(f"Unknown phantom preset {preset!r}. Available:\n{available}")
 
     return PHANTOM_PRESETS[preset](
-        N=N,
-        voxel_cm=voxel_cm,
+        N=N, Nx=Nx, Ny=Ny, Nz=Nz, voxel_cm=voxel_cm, **preset_kwargs
     )

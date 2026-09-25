@@ -78,6 +78,12 @@ The Vo et al. (2018) ring-removal algorithm is applied to each 2-D
 sinogram slice before reconstruction (``remove_rings=True``).  It subtracts
 systematic column offset patterns introduced by detector gain variations.
 
+Because that is exactly the signal ``ArtifactConfig(ring_artifacts=True)``
+injects, enabling both cancels the artifact under study.
+``DualModalitySimulation`` disables ring removal automatically for runs that
+inject rings; call ``reconstruct(..., remove_rings=False)`` for the same effect
+when driving the reconstructor directly.
+
 References
 ----------
 * Van Aarle et al. (2016) Optics Express 24(22): ASTRA Toolbox.
@@ -90,7 +96,6 @@ References
 from __future__ import annotations
 
 import warnings
-from typing import Optional
 
 import numpy as np
 from scipy.ndimage import median_filter
@@ -117,36 +122,49 @@ AVAILABLE_ALGORITHMS = [
     "NESTEROV_SIRT",# SIRT + Nesterov acceleration     (iterative, GPU)
 ]
 
-# Maps user-facing aliases → canonical keys
+# Maps user-facing aliases → canonical keys. Keys are stored in the same
+# normalised form _resolve_algorithm() produces (upper-case, hyphens replaced
+# by underscores); writing them with hyphens made those entries unreachable.
 _ALG_ALIASES: dict[str, str] = {
-    "RAM-LAK":        "FBP",
-    "RAMP":           "FBP",
-    "BACKPROJECTION": "FBP",
-    "GRID":           "GRIDREC",
-    "CGLS_ASTRA":     "CGLS",
-    "CONJUGATE":      "CGLS",
-    "MLEM":           "EM",
-    "ML-EM":          "EM",
-    "OS-SART":        "OSSART",
-    "TV":             "TV_MIN",
-    "TOTAL_VARIATION":"TV_MIN",
-    "NESTEROV":       "NESTEROV_SIRT",
-    "SIRT_NESTEROV":  "NESTEROV_SIRT",
+    "RAM_LAK":         "FBP",
+    "RAMP":            "FBP",
+    "BACKPROJECTION":  "FBP",
+    "GRID":            "GRIDREC",
+    "CGLS_ASTRA":      "CGLS",
+    "CONJUGATE":       "CGLS",
+    "MLEM":            "EM",
+    "ML_EM":           "EM",
+    "OS_SART":         "OSSART",
+    "TV":              "TV_MIN",
+    "TOTAL_VARIATION": "TV_MIN",
+    "NESTEROV":        "NESTEROV_SIRT",
+    "SIRT_NESTEROV":   "NESTEROV_SIRT",
 }
 
-# Algorithms that require ASTRA
+
+def _normalise_algorithm_key(name: str) -> str:
+    """Upper-case and unify separators, so 'os-sart' and 'OS_SART' agree."""
+    return name.strip().upper().replace("-", "_").replace(" ", "_")
+
+# Algorithms with no CPU implementation. FBP is deliberately absent: it
+# falls back to skimage's validated `iradon`.
 _ASTRA_ALGORITHMS = {"SIRT", "SART", "CGLS", "EM", "OSSART", "TV_MIN",
-                     "NESTEROV_SIRT", "FBP"}
+                     "NESTEROV_SIRT"}
 
 
 def _resolve_algorithm(name: str) -> str:
-    """Return the canonical algorithm name, raising ValueError if unknown."""
-    key = name.upper().replace("-", "_")
+    """Return the canonical algorithm name, raising ValueError if unknown.
+
+    Accepts any spelling that differs only in case or separator, plus the
+    aliases in :data:`_ALG_ALIASES` (``'ram-lak'``, ``'os-sart'``, ``'tv'``, …).
+    """
+    key = _normalise_algorithm_key(name)
     key = _ALG_ALIASES.get(key, key)
     if key not in AVAILABLE_ALGORITHMS:
         raise ValueError(
-            f"Unknown algorithm '{name}'. "
-            "Available: " + ", ".join(AVAILABLE_ALGORITHMS)
+            f"Unknown algorithm {name!r}. Available: "
+            + ", ".join(AVAILABLE_ALGORITHMS)
+            + "; aliases: " + ", ".join(sorted(_ALG_ALIASES))
         )
     return key
 
@@ -175,33 +193,35 @@ def _tomopy_ok() -> bool:
 # Pre-processing helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _remove_rings_vo(sinogram: np.ndarray,
-                     snr: float = 3.0,
-                     la: int = 11) -> np.ndarray:
+def _remove_rings_vo(sinogram: np.ndarray, la: int = 11) -> np.ndarray:
     """
-    Vo et al. (2018) ring-removal algorithm.
+    Ring removal after Vo et al. (2018), "large-stripe" variant.
 
-    Subtracts systematic column offset patterns that arise from detector gain
-    variations.  Applied to each 2-D (n_angles × n_det) sinogram slice.
+    Detector columns with a systematic gain or offset error show up as a
+    deviation of the column mean from its local median.  Subtracting that
+    deviation removes the stripe in the sinogram, and hence the ring in the
+    reconstruction.
+
+    Note that this targets exactly the signal that
+    ``ArtifactConfig(ring_artifacts=True)`` injects, so the two should not be
+    enabled together — ``DualModalitySimulation`` handles that automatically.
 
     Parameters
     ----------
     sinogram : (n_angles, n_det)
-    snr      : signal-to-noise threshold; lower = more aggressive removal
-    la       : median filter window size for smoothing the column mean
+    la       : median-filter window used to smooth the column mean; larger
+               values preserve broader real structure and remove only narrow
+               stripes.
 
     Returns
     -------
     corrected : (n_angles, n_det) sinogram with ring-causing offsets removed
     """
-    col_mean   = sinogram.mean(axis=0)
-    col_smooth = median_filter(col_mean, size=la)
-    residual   = col_mean - col_smooth
-    if residual.std() > 0:
-        corrected = sinogram - residual[np.newaxis, :]
-    else:
-        corrected = sinogram.copy()
-    return corrected
+    col_mean = sinogram.mean(axis=0)
+    residual = col_mean - median_filter(col_mean, size=la)
+    if residual.std() == 0:
+        return sinogram.copy()
+    return sinogram - residual[np.newaxis, :]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -425,7 +445,7 @@ def reconstruct(
     n_subsets: int = 10,
     lambda_tv: float = 0.02,
     remove_rings: bool = True,
-    ring_snr: float = 3.0,
+    ring_filter_width: int = 11,
     center_offset: float = 0.0,
     use_astra: bool = True,
     clip_negative: bool = True,
@@ -452,7 +472,10 @@ def reconstruct(
     lambda_tv    : TV regularisation weight for TV_MIN
                    (higher → smoother; typical range 0.005 – 0.1).
     remove_rings : apply Vo (2018) ring-removal before reconstruction.
-    ring_snr     : SNR threshold for ring removal (lower = more aggressive).
+                   Leave this off when studying injected ring artifacts —
+                   it removes exactly the offsets that artifact adds.
+    ring_filter_width: median-filter width for ring removal, in detector
+                   pixels (larger = only narrow stripes are removed).
     center_offset: rotation-centre offset in pixels (0 = no correction).
     use_astra    : prefer ASTRA GPU if available.
     clip_negative: clip result to ≥ 0 after reconstruction.
@@ -481,15 +504,15 @@ def reconstruct(
     vol     = np.zeros((N_slice, N_det, N_det), dtype=np.float32)
     use_gpu = use_astra and _astra_ok()
 
-    if not use_gpu and alg in _ASTRA_ALGORITHMS and alg not in ("FBP",):
+    if not use_gpu and alg in _ASTRA_ALGORITHMS:
         warnings.warn(
             f"ASTRA not available — falling back to skimage FBP "
             f"(requested: {alg})."
-        )
+        , stacklevel=2)
         alg = "FBP"
 
     if alg == "GRIDREC" and not _tomopy_ok():
-        warnings.warn("TomoPy not available — falling back to skimage FBP.")
+        warnings.warn("TomoPy not available — falling back to skimage FBP.", stacklevel=2)
         alg = "FBP"
 
     if use_gpu:
@@ -499,7 +522,7 @@ def reconstruct(
         sino2d = sino_lam[:, s_idx, :].astype(np.float32)
 
         if remove_rings:
-            sino2d = _remove_rings_vo(sino2d, snr=ring_snr)
+            sino2d = _remove_rings_vo(sino2d, la=ring_filter_width)
 
         if center_offset != 0.0:
             from scipy.ndimage import shift
@@ -530,7 +553,7 @@ def reconstruct(
                     warnings.warn(
                         f"FBP_CUDA failed ({_fbp_err!s}); "
                         "falling back to skimage iradon."
-                    )
+                    , stacklevel=2)
                     try:
                         astra.algorithm.delete(alg_id)
                     except Exception:

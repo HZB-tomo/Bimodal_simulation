@@ -61,12 +61,10 @@ The two iron phases use data files shipped with NCrystal's standard library:
 
 from __future__ import annotations
 
-import warnings
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Union
 
 import numpy as np
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  Neutron energy ↔ wavelength
@@ -91,7 +89,7 @@ def energy_meV_to_wavelength_A(E_meV) -> np.ndarray:
 #  NCrystal availability
 # ──────────────────────────────────────────────────────────────────────────────
 try:                                # pragma: no cover - depends on environment
-    import NCrystal as _NC          # type: ignore
+    import NCrystal as _NC  # type: ignore
     NCRYSTAL_AVAILABLE = True
     NCRYSTAL_VERSION = getattr(_NC, "__version__", "unknown")
 except Exception:                   # pragma: no cover
@@ -219,7 +217,7 @@ def _as_float(value) -> float:
     try:
         return float(value)
     except TypeError:
-        return float(getattr(value, "value"))
+        return float(value.value)
 
 
 def _xsect_barn(process, wl_A: np.ndarray) -> np.ndarray:

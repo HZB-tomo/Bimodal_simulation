@@ -7,6 +7,7 @@ particle.
 """
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import Literal, Optional, Tuple
 
@@ -94,8 +95,25 @@ def generate_nmc_particle_slab(
     radii: list[float] = []
     accepted_diameters: list[float] = []
 
+    # Largest radius that still fits inside the slab and the transverse extent.
+    # Without this guard, an oversized particle makes the sampling interval below
+    # run backwards and NumPy raises an opaque "high - low < 0".
+    max_radius_um = min(slab_thickness, full_um[1], full_um[2]) / 2
+    if cfg.diameter_min_um / 2 >= max_radius_um:
+        raise ValueError(
+            f"No particle fits: the smallest requested diameter "
+            f"({cfg.diameter_min_um:g} µm) is not smaller than the volume's "
+            f"limiting extent ({2 * max_radius_um:g} µm — the smaller of the "
+            f"{slab_thickness:g} µm slab thickness and the transverse size). "
+            "Increase shape_zyx or slab_thickness_um, or reduce the diameters."
+        )
+
+    n_too_large = 0
     for diameter in diameters:
         r = diameter / 2
+        if r >= max_radius_um:
+            n_too_large += 1
+            continue
         accepted = False
         for _ in range(cfg.max_attempts_per_particle):
             z = rng.uniform(-slab_thickness / 2 + r, slab_thickness / 2 - r)
@@ -114,6 +132,15 @@ def generate_nmc_particle_slab(
             break
         if not accepted:
             break
+
+    if n_too_large:
+        warnings.warn(
+            f"{n_too_large} of {len(diameters)} sampled particles were larger "
+            f"than the volume allows (radius ≥ {max_radius_um:g} µm) and were "
+            "skipped. Enlarge shape_zyx or slab_thickness_um to keep the "
+            "requested size distribution intact.",
+            stacklevel=2,
+        )
 
     labels = np.zeros((nz, ny, nx), dtype=np.uint16)
     z0, y0, x0 = -full_um / 2

@@ -58,7 +58,6 @@ import numpy as np
 from .materials import MATERIALS, Material
 from .phantom import PhantomData
 
-
 PathLike = Union[str, Path]
 MetadataLike = Union["SegmentationMetadata", Mapping[str, object], PathLike]
 

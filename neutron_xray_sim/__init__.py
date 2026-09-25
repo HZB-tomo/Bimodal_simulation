@@ -1,11 +1,12 @@
 """
 neutron_xray_sim
 ════════════════
-Dual-modality neutron / X-ray tomography simulation package.
+Dual-modality neutron / X-ray tomography simulation package (DIANA).
 
-Complete pipeline:
+Complete pipeline::
+
     PhantomData → forward projection → artifact injection
-    → CT reconstruction → bimodal histogram analysis
+                → CT reconstruction → bimodal histogram analysis
 
 Quick start
 ───────────
@@ -16,202 +17,186 @@ Quick start
 
     sim = DualModalitySimulation(preset="composite", N=64, n_angles=120)
 
-    # Clean reference
-    r_clean = sim.run(ArtifactConfig.clean(), tag="clean")
-
-    # Realistic artifacts
+    r_clean = sim.run(ArtifactConfig.clean(),     tag="clean")
     r_real  = sim.run(ArtifactConfig.realistic(), tag="realistic")
 
-    # Custom: misalignment only
-    r_mis   = sim.run(
-        ArtifactConfig(misalignment=True, translation_voxels=(4,0,0)),
-        tag="misalignment",
-    )
-
-    fig = sim.comparison_grid()
+    fig = sim.comparison_grid([r_clean, r_real])
     plt.show()
 
 Modules
 ───────
-materials     : Material database (11 materials, X-ray and neutron coefficients)
-phantom       : Voxelised 3-D phantom builder + 4 preset phantoms
-projector     : Polychromatic X-ray + thermal neutron forward projection
-artifacts     : ArtifactConfig dataclass + all artifact injection functions
-reconstructor : FBP / SIRT / CGLS CT reconstruction (ASTRA GPU or NumPy)
-histogram     : 2-D bimodal histogram, GMM fitting, segmentation, plotting
-simulation    : DualModalitySimulation orchestrator + SimulationResult
+======================  ======================================================
+``materials``           Material registry, specs, and element data
+``phantom``             ``PhantomData``, ``PhantomBuilder``, preset registry
+``projector``           Polychromatic X-ray + thermal neutron forward projection
+``artifacts``           ``ArtifactConfig`` and all artifact injection
+``reconstructor``       FBP / SIRT / SART / CGLS / … reconstruction
+``histogram``           2-D bimodal histogram, GMM fitting, segmentation
+``simulation``          ``DualModalitySimulation`` orchestrator
+``neutron_spectra``     Thermal / cold / ILL-NeXT beam models
+``volume_importer``     Phantoms from real segmented volumes
+``metrics_table``       Tabulated cluster-quality metrics
+``noise``               Dose models and detectability metrics
+``io``                  On-disk ``SimCache`` for pipeline stages
+``diana_plots``         Publication-figure plotting helpers
+======================  ======================================================
+
+Plotting namespaces
+───────────────────
+``histogram`` and ``diana_plots`` both define ``plot_bimodal_histogram``, with
+different signatures and styling.  They are *not* both re-exported flat here —
+doing so silently shadowed one with the other.  Import the one you want::
+
+    from neutron_xray_sim.histogram import plot_bimodal_histogram      # analysis
+    from neutron_xray_sim import diana_plots                           # figures
+    diana_plots.plot_bimodal_histogram(...)
 """
 
-from .materials import (
-    Material,
-    MATERIALS,
-    XRAY_E_KEV,
-    xray_spectrum,
-    AIR, WATER, ALUMINUM, HDPE, IRON, TITANIUM,
-    COPPER, LEAD, BONE, TUNGSTEN, ZINC,
-    make_composite_material,
-    material_from_formula,
-)
+from __future__ import annotations
 
-from .phantom import (
-    PhantomData,
-    PhantomBuilder,
-    make_phantom,
-    make_composite_phantom,
-    make_battery_phantom,
-    make_bone_implant_phantom,
-    make_industrial_phantom,
-    make_custom_cylindrical_battery_phantom,
-    make_hdpe_composite_phantom,
-    
-    PHANTOM_PRESETS,
+# Submodules exposed as attributes, so `neutron_xray_sim.diana_plots.…` works
+# after a plain `import neutron_xray_sim`.
+from . import (
+    artifacts,
+    diana_plots,
+    histogram,
+    io,
+    materials,
+    noise,
+    phantom,
+    projector,
+    reconstructor,
+    simulation,
 )
-
-from .projector import (
-    project_xray,
-    project_neutron,
-    make_sinogram_pair,
-)
-
 from .artifacts import (
+    PRESET_CONFIGS,
     ArtifactConfig,
     inject_sinogram_artifacts,
     inject_volume_artifacts,
-    PRESET_CONFIGS,
 )
-
-from .reconstructor import (
-    reconstruct,
-    reconstruct_pair,
-    AVAILABLE_ALGORITHMS,
-)
-
-from .io import (
-    SimCache,
-    tag_to_slug,
-)
-
 from .histogram import (
-    HistogramResult,
-    GMMFitResult,
     ArtifactSignatures,
     ClusterQualityMetrics,
+    GMMFitResult,
+    HistogramResult,
+    auto_fit_gmm,
+    compare_algorithms,
     compute_bimodal_histogram,
     compute_ground_truth_histogram,
-    fit_gmm,
-    auto_fit_gmm,
-    segment_by_gmm,
-    segment_by_polygon,
     detect_artifact_signatures,
     evaluate_histogram_quality,
-    compare_algorithms,
+    fit_gmm,
+    make_cross_algorithm_sinos,
     plot_bimodal_histogram,
-    plot_ground_truth_comparison,
     plot_comparison_grid,
     plot_cross_algorithm_grid,
-    make_cross_algorithm_sinos,
+    plot_ground_truth_comparison,
+    segment_by_gmm,
+    segment_by_polygon,
 )
-
-from .simulation import (
-    SimulationResult,
-    DualModalitySimulation,
-    run_artifact_survey,
+from .io import SimCache, tag_to_slug
+from .materials import (
+    MATERIALS,
+    XRAY_E_KEV,
+    Material,
+    MaterialRegistry,
+    MaterialSpec,
+    available_elements,
+    build_material,
+    element_data_status,
+    make_composite_material,
+    material_from_formula,
+    xray_spectrum,
 )
-
-from .metrics_table import (
-    HistogramMetricsTable,
-    compute_histogram_metrics,
-)
-
-from .metrics_table_morphology import (
-    compute_histogram_metrics_morphology_aware,
-)
-
+from .metrics_table import HistogramMetricsTable, compute_histogram_metrics
+from .metrics_table_morphology import compute_histogram_metrics_morphology_aware
 from .neutron_spectra import (
     NEUTRON_MODES,
-    mu_n_lut_for_beam,
-    mu_n_spectrum_lut,
-    plot_spectra,
     cold_mono_beam,
     cold_poly_beam,
     ill_next_beam,
-    
+    mu_n_lut_for_beam,
+    mu_n_spectrum_lut,
+    plot_spectra,
 )
-
-from .diana_plots import (
-	plot_phantom_label_map,
-	plot_bimodal_histogram,
-	plot_xray_marginal,
-	plot_neutron_marginal,
-	plot_reconstruction_slice,
-	plot_CE_vs_nprojections,
-	plot_DB_vs_nprojections,
-	plot_sigma_x_vs_nprojections,
-	plot_sigma_n_vs_nprojections,
-	plot_CE_all_geometries,
-	plot_DB_all_geometries,
-	plot_cross_sweep_heatmap,
-	plot_xray_attenuation_spectra,
-	plot_epsilon_vs_nprojections,
-	plot_pairwise_overlap_vs_nprojections,
-	plot_artifact_fingerprint,
-	plot_metric_by_artifact,
-	plot_algorithm_cross_heatmap,
-	plot_rare_phase_failure,
-	plot_metric_vs_param_multi,
-	plot_nstar_vs_margin,
-	plot_recovery_heatmap,
-	plot_grouped_bars_with_ci,
-	_make_dummy_hist,
-	_demo,
-	
+from .noise import (
+    add_poisson_noise,
+    add_poisson_noise_streaming,
+    cnr,
+    d_prime,
+    joint_d_prime,
+    material_stats,
+    measure_sigma_lambda,
+    predicted_sigma_lambda,
+    rose_dose_threshold,
 )
-
-from .noise import(
-	add_poisson_noise,
-	add_poisson_noise_streaming,
-	predicted_sigma_lambda,
-	measure_sigma_lambda,
-	material_stats,
-	cnr,
-	d_prime,
-	joint_d_prime,
-	rose_dose_threshold,
-	
+from .phantom import (
+    PHANTOM_DESCRIPTIONS,
+    PHANTOM_PRESETS,
+    PhantomBuilder,
+    PhantomData,
+    make_battery_phantom,
+    make_bone_implant_phantom,
+    make_composite_phantom,
+    make_custom_cylindrical_battery_phantom,
+    make_hdpe_composite_phantom,
+    make_industrial_phantom,
+    make_li_ion_battery_phantom,
+    make_phantom,
+    register_phantom,
+    resolve_grid,
 )
+from .projector import make_sinogram_pair, project_neutron, project_xray
+from .reconstructor import AVAILABLE_ALGORITHMS, reconstruct, reconstruct_pair
+from .simulation import DualModalitySimulation, SimulationResult, run_artifact_survey
 
-__version__  = "1.1.0"
-__author__   = "neutron_xray_sim contributors"
+__version__ = "1.2.0"
+__author__ = "DIANA contributors, Helmholtz-Zentrum Berlin"
 
 __all__ = [
+    "__version__",
+    # Submodules
+    "artifacts", "diana_plots", "histogram", "io", "materials", "noise",
+    "phantom", "projector", "reconstructor", "simulation",
     # Materials
-    "Material", "MATERIALS", "XRAY_E_KEV", "xray_spectrum",
-    "AIR", "WATER", "ALUMINUM", "HDPE", "IRON", "TITANIUM",
-    "COPPER", "LEAD", "BONE", "TUNGSTEN", "ZINC",
+    "Material", "MaterialSpec", "MaterialRegistry", "MATERIALS", "XRAY_E_KEV",
+    "build_material", "material_from_formula", "make_composite_material",
+    "xray_spectrum", "available_elements", "element_data_status",
     # Phantom
-    "PhantomData", "PhantomBuilder", "make_phantom",
+    "PhantomData", "PhantomBuilder", "make_phantom", "resolve_grid",
+    "register_phantom", "PHANTOM_PRESETS", "PHANTOM_DESCRIPTIONS",
     "make_composite_phantom", "make_battery_phantom",
     "make_bone_implant_phantom", "make_industrial_phantom",
-    "PHANTOM_PRESETS",
+    "make_hdpe_composite_phantom", "make_li_ion_battery_phantom",
+    "make_custom_cylindrical_battery_phantom",
     # Projection
     "project_xray", "project_neutron", "make_sinogram_pair",
     # Artifacts
-    "ArtifactConfig", "inject_sinogram_artifacts",
-    "inject_volume_artifacts", "PRESET_CONFIGS",
+    "ArtifactConfig", "inject_sinogram_artifacts", "inject_volume_artifacts",
+    "PRESET_CONFIGS",
     # Reconstruction
     "reconstruct", "reconstruct_pair", "AVAILABLE_ALGORITHMS",
     # IO / cache
     "SimCache", "tag_to_slug",
     # Histogram
-    "HistogramResult", "GMMFitResult", "ArtifactSignatures", "ClusterQualityMetrics",
-    "compute_bimodal_histogram", "compute_ground_truth_histogram",
-    "fit_gmm", "auto_fit_gmm",
-    "segment_by_gmm", "segment_by_polygon",
-    "detect_artifact_signatures",
+    "HistogramResult", "GMMFitResult", "ArtifactSignatures",
+    "ClusterQualityMetrics", "compute_bimodal_histogram",
+    "compute_ground_truth_histogram", "fit_gmm", "auto_fit_gmm",
+    "segment_by_gmm", "segment_by_polygon", "detect_artifact_signatures",
     "evaluate_histogram_quality", "compare_algorithms",
-    "plot_bimodal_histogram", "plot_ground_truth_comparison", "plot_comparison_grid",
-    "plot_cross_algorithm_grid", "make_cross_algorithm_sinos",
+    "plot_bimodal_histogram", "plot_ground_truth_comparison",
+    "plot_comparison_grid", "plot_cross_algorithm_grid",
+    "make_cross_algorithm_sinos",
+    # Metrics
+    "HistogramMetricsTable", "compute_histogram_metrics",
+    "compute_histogram_metrics_morphology_aware",
+    # Neutron spectra
+    "NEUTRON_MODES", "mu_n_lut_for_beam", "mu_n_spectrum_lut", "plot_spectra",
+    "cold_mono_beam", "cold_poly_beam", "ill_next_beam",
+    # Noise / dose
+    "add_poisson_noise", "add_poisson_noise_streaming",
+    "predicted_sigma_lambda", "measure_sigma_lambda", "material_stats",
+    "cnr", "d_prime", "joint_d_prime", "rose_dose_threshold",
     # Simulation
     "SimulationResult", "DualModalitySimulation", "run_artifact_survey",
-    "ClusterQualityMetrics",
 ]

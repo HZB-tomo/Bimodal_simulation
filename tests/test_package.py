@@ -8,13 +8,21 @@ import neutron_xray_sim as nxs
 
 
 def test_import_has_no_side_effects(tmp_path):
+    # Only warnings raised by DIANA itself count: third-party libraries (e.g.
+    # older matplotlib + new pyparsing) may emit deprecation warnings on import.
     code = (
-        "import matplotlib as m; before = dict(m.rcParams); "
-        "import neutron_xray_sim; "
-        "import os; assert not os.path.exists('outputs_disc_sweep'); "
-        "assert dict(m.rcParams) == before, 'rcParams changed'"
+        "import os, warnings\n"
+        "import matplotlib as m\n"
+        "before = dict(m.rcParams)\n"
+        "with warnings.catch_warnings(record=True) as caught:\n"
+        "    warnings.simplefilter('always')\n"
+        "    import neutron_xray_sim\n"
+        "ours = [str(w.message) for w in caught if 'neutron_xray_sim' in w.filename]\n"
+        "assert not ours, ours\n"
+        "assert not os.path.exists('outputs_disc_sweep')\n"
+        "assert dict(m.rcParams) == before, 'rcParams changed'\n"
     )
-    res = subprocess.run([sys.executable, "-W", "error::UserWarning", "-c", code],
+    res = subprocess.run([sys.executable, "-c", code],
                          cwd=tmp_path, capture_output=True, text=True,
                          env={**os.environ, "MPLBACKEND": "Agg"})
     assert res.returncode == 0, res.stderr
